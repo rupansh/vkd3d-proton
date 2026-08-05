@@ -10,6 +10,7 @@ run_stress=
 export VKD3D_SHADER_CACHE_PATH=0
 
 args=()
+excludes=()
 # by default run one job per cpu thread
 # /proc/cpuinfo does not exist under a native Windows bash (Git for Windows,
 # MSYS2), where this would silently evaluate to 0 and the run loop below would
@@ -37,8 +38,16 @@ while [[ $# -gt 0 ]]; do
 		shift
 		shift
 		;;
+	-x|--exclude)
+		# skip one test by exact name. Repeatable. Every exclusion is echoed
+		# below, because a silently skipped test is indistinguishable from a
+		# passing one in the summary.
+		excludes+=("$2")
+		shift
+		shift
+		;;
 	-h|--help)
-		echo "./test-runner.sh [-o|--output-dir logfile_dir] [-s|--run-stress-tests] [-j|--jobs N] path/to/tests/d3d12"
+		echo "./test-runner.sh [-o|--output-dir logfile_dir] [-s|--run-stress-tests] [-j|--jobs N] [-x|--exclude test_name]... path/to/tests/d3d12"
 		exit 1
 		;;
 	-*|--*)
@@ -75,6 +84,32 @@ if [[ -z $run_stress ]] ; then
 		fi
 	done
 	tests=(${compacted[@]})
+fi
+
+# -x/--exclude, applied loudly: an exclusion that is not printed is a lie in the
+# summary, and an -x for a test that does not exist is a typo that would
+# otherwise silently do nothing.
+if [[ ${#excludes[@]} -gt 0 ]] ; then
+	kept=()
+	for t in "${tests[@]}" ; do
+		drop=
+		for x in "${excludes[@]}" ; do
+			if [[ "$t" == "$x" ]] ; then drop=1 ; fi
+		done
+		if [[ -n $drop ]] ; then
+			echo "EXCLUDED $t"
+		else
+			kept+=($t)
+		fi
+	done
+	for x in "${excludes[@]}" ; do
+		found=
+		for t in "${tests[@]}" ; do
+			if [[ "$t" == "$x" ]] ; then found=1 ; fi
+		done
+		if [[ -z $found ]] ; then echo "WARNING: --exclude $x matched no test" ; fi
+	done
+	tests=(${kept[@]})
 fi
 
 # runtime variable init
