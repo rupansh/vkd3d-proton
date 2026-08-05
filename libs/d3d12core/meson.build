@@ -1,5 +1,10 @@
 d3d12core_src = [
   'debug.c',
+  # Helios addition: split out of main.c so the static arm below can link the
+  # five predicates libvkd3d calls without pulling in main.c's dxgi import.
+  # Behaviour for d3d12core.dll and helios_vkd3d.dll is unchanged -- same code,
+  # same TU count in the final image, one more object file.
+  'debug_control.c',
   'main.c'
 ]
 
@@ -64,10 +69,23 @@ helios_vkd3d_lib = shared_library('helios_vkd3d', d3d12core_src + [ 'helios_entr
 # debug.c IS kept: helios_entry.c uses TRACE/ERR/debugstr_guid, and it carries no
 # dxgi reference of its own (verified).
 #
+# ⛔ debug_control.c IS ALSO KEPT, and dropping it is not an option.  Omitting
+# main.c cost more than the dxgi import: main.c also defined the five
+# vkd3d_debug_control_* predicates that libvkd3d's device.c/command.c/resource.c/
+# state.c call unconditionally, so the first attempt to link this archive into
+# the D12-G1 probe produced 19 unresolved externals (5 of them these; the other
+# 14 were __imp_D3DKMT*, i.e. a missing gdi32, which is the consumer's job).
+# Those predicates now live in debug_control.c, which references no dxgi.  See
+# that file's header comment for why the split beats restating them here.
+#
 # No .def and no vs_module_defs, deliberately — a static library has no export
 # table.  helios_umd12.dll does not re-export these, it calls them.
+#
+# ⚠ Consumers must add `gdi32` themselves: libs/vkd3d/d3dkmt.c imports 12
+# D3DKMT entry points and vkd3d_dep does not carry lib_gdi32.  Recorded in
+# tmp/dx12/gates/G1-static/ as part of the measured minimal link set.
 helios_d3d12_static_lib = static_library('helios_d3d12_static',
-  [ 'debug.c', 'helios_entry.c' ],
+  [ 'debug.c', 'debug_control.c', 'helios_entry.c' ],
   dependencies        : [ vkd3d_dep ],
   include_directories : vkd3d_private_includes,
   install             : true)
