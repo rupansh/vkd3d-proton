@@ -1,0 +1,7 @@
+LIBRARY helios_vkd3d.dll
+
+EXPORTS
+    D3D12GetInterface
+    D3D12SDKVersion DATA PRIVATE
+    helios_vkd3d_create_device
+    helios_vkd3d_serialize_root_signature
