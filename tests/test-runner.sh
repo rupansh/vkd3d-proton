@@ -11,7 +11,13 @@ export VKD3D_SHADER_CACHE_PATH=0
 
 args=()
 # by default run one job per cpu thread
-nr_cpus=$(grep -w processor /proc/cpuinfo|wc -l)
+# /proc/cpuinfo does not exist under a native Windows bash (Git for Windows,
+# MSYS2), where this would silently evaluate to 0 and the run loop below would
+# then never start a single test while reporting "0 / N complete" forever.
+nr_cpus=$(grep -w processor /proc/cpuinfo 2>/dev/null | wc -l)
+if [ "$nr_cpus" -lt 1 ] 2>/dev/null || [ -z "$nr_cpus" ] ; then
+	nr_cpus=$(nproc 2>/dev/null || echo 1)
+fi
 while [[ $# -gt 0 ]]; do
 	case $1 in
 	-o|--output-dir)
@@ -53,7 +59,13 @@ if [[ -z $d3d12_bin || ! -f "$d3d12_bin" ]] ; then
 	exit 1
 fi
 
-mapfile -t tests < <("$d3d12_bin" --list-tests)
+# Strip CR: the test binary's stdout is CRLF-terminated when it runs natively on
+# Windows, and mapfile -t removes only the LF. A trailing CR on every name makes
+# VKD3D_TEST_MATCH match nothing, so each invocation runs only the handful of
+# unconditional tests and reports "3 tests executed (0 failures)" -- and the
+# runner then prints ALL PASSED! for a run that executed almost none of the
+# suite. It also embeds a CR in every log filename.
+mapfile -t tests < <("$d3d12_bin" --list-tests | tr -d '\r')
 
 if [[ -z $run_stress ]] ; then
 	compacted=()
