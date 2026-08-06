@@ -2176,6 +2176,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     alloc_info.heap_properties = info->heap_desc.Properties;
     alloc_info.heap_flags = info->heap_desc.Flags;
     alloc_info.host_ptr = info->host_ptr;
+    alloc_info.pNext = info->pNext;
     alloc_info.vk_memory_priority = info->vk_memory_priority;
     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
 

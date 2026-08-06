@@ -813,6 +813,7 @@ struct vkd3d_allocate_heap_memory_info
 {
     D3D12_HEAP_DESC heap_desc;
     void *host_ptr;
+    const void *pNext;
     uint32_t extra_allocation_flags;
     float vk_memory_priority;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;

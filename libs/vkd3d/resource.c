@@ -186,7 +186,17 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
 
     /* This is only used by OpenExistingHeapFrom*,
      * and external host memory is the only way for us to do CROSS_ADAPTER. */
-    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)
+    if (heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT)
+    {
+        /* Helios WDDM adoption uses the venus OPAQUE_FD wire identity. The matching
+         * VkExportMemoryAllocateInfo is attached by the committed-buffer allocation
+         * path below; Vulkan requires both declarations for external memory. */
+        external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        external_info.pNext = NULL;
+        external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        buffer_info.pNext = &external_info;
+    }
+    else if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)
     {
         external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
         external_info.pNext = NULL;
@@ -4550,6 +4560,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
     else
     {
         struct vkd3d_allocate_heap_memory_info allocate_info;
+        VkExportMemoryAllocateInfo export_info;
 
         memset(&allocate_info, 0, sizeof(allocate_info));
         allocate_info.heap_desc.Properties = *heap_properties;
@@ -4557,6 +4568,18 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         allocate_info.heap_desc.SizeInBytes = align(desc->Width, allocate_info.heap_desc.Alignment);
         allocate_info.heap_desc.Flags = heap_flags | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
         allocate_info.vk_memory_priority = object->priority.residency_count ? vkd3d_convert_to_vk_prio(object->priority.d3d12priority) : 0.f;
+
+        if (heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT)
+        {
+            /* Buffers use vkd3d_allocate_heap_memory rather than the image allocator,
+             * so mirror the image arm's two guarantees here: an OPAQUE_FD export for
+             * the venus resource id and a dedicated allocation at offset zero. */
+            memset(&export_info, 0, sizeof(export_info));
+            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            allocate_info.pNext = &export_info;
+            allocate_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_DEDICATED;
+        }
 
         if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
         {
