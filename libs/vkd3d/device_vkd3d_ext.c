@@ -1145,7 +1145,44 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanHeapInfo(d3d
     return S_OK;
 }
 
-CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl =
+static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_GetVulkanResourceMemoryInfo(d3d12_dxvk_interop_device_iface *iface,
+    ID3D12Resource *resource, UINT64 *vk_memory, UINT64 *memory_offset, UINT64 *memory_size, UINT32 *vk_memory_type)
+{
+    struct d3d12_device *device = d3d12_device_from_ID3D12DXVKInteropDevice(iface);
+    const struct vkd3d_memory_allocation *allocation;
+    struct d3d12_resource *resource_impl;
+
+    TRACE("iface %p, resource %p, vk_memory %p, memory_offset %p, memory_size %p, vk_memory_type %p.\n",
+        iface, resource, vk_memory, memory_offset, memory_size, vk_memory_type);
+
+    if (!resource || !vk_memory || !memory_offset || !memory_size || !vk_memory_type)
+        return E_INVALIDARG;
+
+    resource_impl = impl_from_ID3D12Resource(resource);
+    if (resource_impl->device != device)
+        return E_INVALIDARG;
+
+    /* A CPU-accessible texture binds its image to private_mem and keeps mem for the host-visible
+     * linear staging buffer, so answering from mem would name memory the image is not bound to.
+     * Pick the same allocation the bind used - see d3d12_resource_create_placed() and
+     * d3d12_resource_create_committed(), both of which branch on this flag when filling
+     * VkBindImageMemoryInfo. */
+    if (d3d12_resource_is_texture(resource_impl) && (resource_impl->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY))
+        allocation = &resource_impl->private_mem;
+    else
+        allocation = &resource_impl->mem;
+
+    if (allocation->device_allocation.vk_memory == VK_NULL_HANDLE)
+        return E_FAIL;
+
+    *vk_memory = (UINT64)allocation->device_allocation.vk_memory;
+    *memory_offset = (UINT64)allocation->offset;
+    *memory_size = (UINT64)allocation->device_allocation.size;
+    *vk_memory_type = allocation->device_allocation.vk_memory_type;
+    return S_OK;
+}
+
+CONST_VTBL struct ID3D12DXVKInteropDevice4Vtbl d3d12_dxvk_interop_device_vtbl =
 {
     /* IUnknown methods */
     d3d12_dxvk_interop_device_QueryInterface,
@@ -1177,6 +1214,9 @@ CONST_VTBL struct ID3D12DXVKInteropDevice3Vtbl d3d12_dxvk_interop_device_vtbl =
 
     /* ID3D12DXVKInteropDevice3 methods */
     d3d12_dxvk_interop_device_GetVulkanHeapInfo,
+
+    /* ID3D12DXVKInteropDevice4 methods */
+    d3d12_dxvk_interop_device_GetVulkanResourceMemoryInfo,
 };
 
 static inline struct d3d12_device *d3d12_device_from_ID3DLowLatencyDevice(d3d_low_latency_device_iface *iface)

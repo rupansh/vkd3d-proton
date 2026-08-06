@@ -105,6 +105,33 @@ interface ID3D12DXVKInteropDevice3 : ID3D12DXVKInteropDevice2
 }
 
 [
+    uuid(9c0850e7-70f1-4229-ae05-440b387ec517),
+    object,
+    local,
+    pointer_default(unique)
+]
+interface ID3D12DXVKInteropDevice4 : ID3D12DXVKInteropDevice3
+{
+    /* The resource-level counterpart of GetVulkanHeapInfo, for callers that need the *memory*
+     * behind a resource rather than the resource itself. Neither existing method can answer:
+     * GetVulkanHeapInfo takes an ID3D12Heap and a committed resource has none, while
+     * GetVulkanResourceInfo1 returns the VkImage/VkBuffer and not the VkDeviceMemory it is
+     * bound to.
+     *
+     * Returns the VkDeviceMemory the resource's image or buffer is BOUND to, the offset it is
+     * bound at, the size of that whole VkDeviceMemory (which is the allocation's
+     * VkMemoryAllocateInfo::allocationSize, not the resource's size - the resource may be a
+     * suballocation of it), and its memory type index. memory_size and memory_offset together
+     * are what an external importer of the memory needs; a caller that wants the resource's own
+     * size has it from the resource description.
+     *
+     * Fails with E_FAIL if the resource has no bound device memory - a reserved (sparse)
+     * resource, for example. */
+    HRESULT GetVulkanResourceMemoryInfo(ID3D12Resource *resource, UINT64 *vk_memory,
+            UINT64 *memory_offset, UINT64 *memory_size, UINT32 *vk_memory_type);
+}
+
+[
     uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
     object,
     local,
