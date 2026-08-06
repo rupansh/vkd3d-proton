@@ -749,6 +749,18 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         vk_prepend_struct(image_info, external_info);
     }
+    else if (resource && (resource->heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT))
+    {
+        /* Helios venus export (see VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT). The memory this
+         * image gets bound to is allocated with a matching VkExportMemoryAllocateInfo in
+         * d3d12_resource_create_committed(), and Vulkan requires the image to declare the
+         * same handle type - VUID-VkMemoryAllocateInfo-pNext-00639 for the dedicated case,
+         * and the host driver rejects the export outright without it. OPAQUE_FD rather than
+         * OPAQUE_WIN32: VK_KHR_external_memory_win32 is absent on this device. */
+        external_info->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        vk_prepend_struct(image_info, external_info);
+    }
 
     disable_compression = false;
 
@@ -4428,6 +4440,32 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
 #else
             FIXME("D3D12_HEAP_FLAG_SHARED can only be implemented in native Win32.\n");
 #endif
+        }
+        else if (heap_flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT)
+        {
+            /* Helios venus export. Two properties are required and both come from this
+             * chain; see VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT for why they are required.
+             *
+             *  - EXPORTABLE, which is what makes the Mesa venus ICD take its export arm and
+             *    give the memory a virtio resource id the guest KMD can adopt.
+             *  - DEDICATED, i.e. one VkDeviceMemory per D3D12 resource at offset 0. The
+             *    Helios adopt path is one venus resource per WDDM allocation, so a
+             *    suballocated back buffer would make N swapchain buffers share one resource
+             *    id and collapse rotation onto a single surface. prefersDedicatedAllocation
+             *    below is what selects the dedicated arm; vkd3d_memory_info_allow_suballocate()
+             *    would also refuse on the non-NULL pNext alone, but relying on that would
+             *    make the guarantee incidental rather than stated.
+             *
+             * ⛔ Deliberately NOT the SHARED arm above: that one exports an OPAQUE_WIN32
+             * handle and then calls vkGetMemoryWin32HandleKHR, whose PFN is NULL here. The
+             * guard at the vkd3d_allocate_memory() call below tests both
+             * (heap_flags & SHARED) and handleTypes == OPAQUE_WIN32, so this arm cannot
+             * reach it on either conjunct. */
+            dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
+            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+            export_info.pNext = allocate_info.pNext;
+            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            allocate_info.pNext = &export_info;
         }
 
         /* Requires implies that prefers is also set by spec. */

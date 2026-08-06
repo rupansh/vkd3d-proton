@@ -1084,6 +1084,39 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
 };
 
+/* Helios: a PRIVATE D3D12_HEAP_FLAGS bit, set by helios_umd12.dll on a committed
+ * resource that the guest kernel driver has to be able to adopt.
+ *
+ * The Helios D3D12 UMD hands dxgkrnl a WDDM allocation whose backing is the venus
+ * resource id behind this resource's VkDeviceMemory, and the Mesa venus ICD only
+ * assigns a resource id on its EXPORT allocation arm (vn_device_memory_alloc ->
+ * vn_device_memory_alloc_export / _guest_vram sets base_bo; every other arm leaves
+ * it NULL and helios_venus_memory_res_id then answers 0, which is exactly the value
+ * that makes the KMD create instead of adopt). So the memory must be allocated with
+ * VkExportMemoryAllocateInfo chained, and the image must be created with a matching
+ * VkExternalMemoryImageCreateInfo.
+ *
+ * D3D12_HEAP_FLAG_SHARED already produces both, and is deliberately NOT reused:
+ * on Win32 it also drives d3d12_resource_open_export_kmt() ->
+ * vkGetMemoryWin32HandleKHR, and VK_KHR_external_memory_win32 does not exist on
+ * this device (the PFN is optional-loaded and NULL), so passing SHARED through is a
+ * null-call crash rather than an export. This bit takes the export chain only, with
+ * OPAQUE_FD as the handle type - the same type the D3D11 Helios path uses for
+ * non-scanout shared surfaces, and the one the ICD normalises to anyway
+ * (vn_device_memory_alloc rewrites export_handle_types to
+ * external_memory.renderer_handle_type unless the caller asked for DMA_BUF).
+ *
+ * 1u << 30 is outside every D3D12_HEAP_FLAGS value the API defines (the highest is
+ * TOOLS_USE_MANUAL_WRITE_TRACKING, 0x2000), so it cannot collide with a runtime
+ * flag, and validate_heap_desc() rejects no unknown bits.
+ *
+ * The mirror of this value on the caller's side is
+ * umd12/src/forward12/resource12.rs's HELIOS_HEAP_FLAG_VENUS_EXPORT. THIS
+ * declaration is the authority; the two must be kept in sync by hand, because the
+ * D3D12 API word is the only channel between them and neither side can see the
+ * other's header. */
+#define VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT ((D3D12_HEAP_FLAGS)(1u << 30))
+
 #define VKD3D_INVALID_TILE_INDEX (~0u)
 
 struct d3d12_sparse_image_region
