@@ -303,6 +303,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         const D3D12_HEAP_DESC *desc, void* host_address)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
+    VkExportMemoryAllocateInfo export_info;
     HRESULT hr;
 
     memset(heap, 0, sizeof(*heap));
@@ -334,6 +335,23 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         d3d12_device_allow_image_heap_suballocation(device))
     {
         alloc_info.extra_allocation_flags = VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION;
+    }
+
+    if (alloc_info.heap_desc.Flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT)
+    {
+        /* Helios forwards the fused D3D12 heap+resource DDI as an explicit heap
+         * with a resource placed at offset zero.  The heap, rather than a
+         * committed resource, therefore owns the VkDeviceMemory that the WDDM
+         * allocation adopts.  Keep that allocation exportable and out of the
+         * allocator's suballocation pools so it has one venus resource id at
+         * offset zero.  This is allocator-dedicated, not a
+         * VkMemoryDedicatedAllocateInfo: child resources are allowed to alias
+         * the same D3D12 heap. */
+        memset(&export_info, 0, sizeof(export_info));
+        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        alloc_info.pNext = &export_info;
+        alloc_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_DEDICATED;
     }
 
     if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))

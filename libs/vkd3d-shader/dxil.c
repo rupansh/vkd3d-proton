@@ -1449,7 +1449,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     dxil_spv_shader_stage stage;
     unsigned int i, max_size;
     vkd3d_shader_hash_t hash;
-    const char *quirk_entry;
+    const char *quirk_entry = NULL;
+    unsigned int entry_point_count;
     int ret = VKD3D_OK;
     void *code;
 
@@ -1477,10 +1478,23 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         goto end;
     }
 
+    stage = dxil_spv_parsed_blob_get_shader_stage(blob);
     if (dxil_spv_parsed_blob_get_entry_point_demangled_name(blob, 0, &quirk_entry) != DXIL_SPV_SUCCESS)
     {
-        ret = VKD3D_ERROR_INVALID_SHADER;
-        goto end;
+        /* dxilconv represents a hull shader with only a patch-constant phase as
+         * a null main entry plus a non-null patch-constant function. dxil-spirv
+         * deliberately supports that representation, but it consequently has
+         * no named entry point for per-entry quirk selection. Keep hash-based
+         * quirks and let the converter synthesize the passthrough phase. */
+        if (stage != DXIL_SPV_STAGE_HULL ||
+                dxil_spv_parsed_blob_get_num_entry_points(blob, &entry_point_count) != DXIL_SPV_SUCCESS ||
+                entry_point_count != 0)
+        {
+            ret = VKD3D_ERROR_INVALID_SHADER;
+            goto end;
+        }
+
+        TRACE("Compiling null-entry hull shader with patch-constant phase.\n");
     }
 
     quirks = vkd3d_shader_compile_arguments_select_quirks(compiler_args, hash, quirk_entry);
@@ -1504,7 +1518,6 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     /* This quirk should only apply to exports. */
     quirks &= ~VKD3D_SHADER_QUIRK_FORCE_NONUNIFORM_RT;
 
-    stage = dxil_spv_parsed_blob_get_shader_stage(blob);
     if (!dxil_match_shader_stage(stage, shader_interface_info->stage))
     {
         ret = VKD3D_ERROR_INVALID_ARGUMENT;
