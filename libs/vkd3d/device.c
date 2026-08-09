@@ -7590,7 +7590,6 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
 #ifdef _WIN32
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
     const struct vkd3d_vk_device_procs *vk_procs;
-    struct DxvkSharedTextureMetadata metadata;
     ID3D12Resource *resource_iface;
     OBJECT_ATTRIBUTES attr = {0};
     ID3D12Fence *fence_iface;
@@ -7622,8 +7621,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
     if (SUCCEEDED(ID3D12DeviceChild_QueryInterface(object, &IID_ID3D12Resource, (void**)&resource_iface)))
     {
         struct d3d12_resource *resource = impl_from_ID3D12Resource(resource_iface);
-        VkMemoryGetWin32HandleInfoKHR win32_handle_info;
-        VkResult vr;
+        NTSTATUS status;
 
         if (!(resource->heap_flags & D3D12_HEAP_FLAG_SHARED))
         {
@@ -7631,61 +7629,29 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
             return DXGI_ERROR_INVALID_CALL;
         }
 
-        if (D3DKMTShareObjects(1, &resource->kmt_local, &attr, access, handle) == STATUS_SUCCESS)
+        /* Helios: the documented WDDM shared object is the only export. The resource
+         * must already own the kernel object that carries its immutable create-time
+         * HWA2 descriptor - an unsupported shape fails here, before any handle is
+         * exported, rather than falling back to a raw Vulkan external handle stamped
+         * with Wine texture metadata. That fallback produced a handle no consumer
+         * could open, i.e. a success return for an export that had not happened. */
+        if (!resource->kmt_local)
         {
+            ERR("Resource %p has no WDDM shared object; this resource shape cannot be shared.\n", resource);
             ID3D12Resource_Release(resource_iface);
-            return S_OK;
+            return E_NOTIMPL;
         }
 
-        if (attributes)
-            FIXME("attributes %p not handled.\n", attributes);
-        if (access)
-            FIXME("access %#x not handled.\n", (int)access);
-        if (name)
-            FIXME("name %s not handled.\n", debugstr_w(name));
-
-        win32_handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-        win32_handle_info.pNext = NULL;
-        win32_handle_info.memory = resource->mem.device_allocation.vk_memory;
-        win32_handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-
-        vr = VK_CALL(vkGetMemoryWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
-
-        if (vr == VK_SUCCESS)
-        {
-            if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-            {
-                FIXME("Shared texture metadata structure only supports 2D textures.");
-            }
-            else
-            {
-                metadata.Width = resource->desc.Width;
-                metadata.Height = resource->desc.Height;
-                metadata.MipLevels = resource->desc.MipLevels;
-                metadata.ArraySize = resource->desc.DepthOrArraySize;
-                metadata.Format = resource->desc.Format;
-                metadata.SampleDesc = resource->desc.SampleDesc;
-                metadata.Usage = D3D11_USAGE_DEFAULT;
-                metadata.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                metadata.CPUAccessFlags = 0;
-                metadata.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-
-                if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-                    metadata.BindFlags |= D3D11_BIND_RENDER_TARGET;
-                if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-                    metadata.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
-                if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-                    metadata.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-                if (resource->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
-                    metadata.BindFlags &= ~D3D11_BIND_SHADER_RESOURCE;
-
-                if (!vkd3d_set_shared_metadata(*handle, &metadata, sizeof(metadata)))
-                    ERR("Failed to set metadata for shared resource, importing created handle will fail.\n");
-            }
-        }
-
+        status = D3DKMTShareObjects(1, &resource->kmt_local, &attr, access, handle);
         ID3D12Resource_Release(resource_iface);
-        return vr ? E_FAIL : S_OK;
+
+        if (status != STATUS_SUCCESS)
+        {
+            ERR("Failed to share resource %p, status %#x.\n", resource, (int)status);
+            return E_FAIL;
+        }
+
+        return S_OK;
     }
 
     if (SUCCEEDED(ID3D12DeviceChild_QueryInterface(object, &IID_ID3D12Fence, (void**)&fence_iface)))
@@ -7734,13 +7700,6 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
 #endif
 }
 
-#ifdef _WIN32
-static inline bool handle_is_kmt_style(HANDLE handle)
-{
-    return ((ULONG_PTR)handle & 0x40000000) && ((ULONG_PTR)handle - 2) % 4 == 0;
-}
-#endif
-
 static HRESULT STDMETHODCALLTYPE d3d12_device_OpenSharedHandle(d3d12_device_iface *iface,
         HANDLE handle, REFIID riid, void **object)
 {
@@ -7756,11 +7715,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenSharedHandle(d3d12_device_ifac
 
     if (IsEqualGUID(riid, &IID_ID3D12Resource))
     {
-        struct DxvkSharedTextureMetadata metadata;
         D3D12_HEAP_PROPERTIES heap_props;
         struct d3d12_resource *resource;
         D3D12_RESOURCE_DESC1 desc;
-        bool kmt_handle = false;
 
         heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
         heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
@@ -7768,85 +7725,21 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenSharedHandle(d3d12_device_ifac
         heap_props.CreationNodeMask = 0;
         heap_props.VisibleNodeMask = 0;
 
-        if (SUCCEEDED(hr = d3d12_device_open_resource_descriptor(device, handle, &desc)))
+        /* Helios: the documented WDDM resource open is the only source of the shared
+         * resource's descriptor, for both NT and KMT-style handles - d3d12_device_open_
+         * resource_descriptor covers the global-handle form itself. There is no
+         * \\.\SharedGpuResource open-by-handle/name step and no Wine metadata IOCTL to
+         * infer a descriptor from, so a handle this driver cannot describe fails here
+         * instead of being opened against a guessed D3D12_RESOURCE_DESC1. */
+        if (FAILED(hr = d3d12_device_open_resource_descriptor(device, handle, &desc)))
         {
-            if (FAILED(hr = d3d12_resource_create_committed(device, &desc, &heap_props,
-                    D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource)))
-            {
-                WARN("Failed to open shared ID3D12Resource, hr %#x.\n", (int)hr);
-                *object = NULL;
-                return hr;
-            }
-
-            return return_interface(&resource->ID3D12Resource_iface, &IID_ID3D12Resource, riid, object);
-        }
-
-        if (handle_is_kmt_style(handle))
-        {
-            handle = vkd3d_open_kmt_handle(handle);
-            kmt_handle = true;
-
-            if (handle == INVALID_HANDLE_VALUE)
-            {
-                WARN("Failed to open KMT-style ID3D12Resource shared handle.\n");
-                *object = NULL;
-                return E_INVALIDARG;
-            }
-        }
-
-        if (!vkd3d_get_shared_metadata(handle, &metadata, sizeof(metadata), NULL))
-        {
-            WARN("Failed to get ID3D12Resource shared handle metadata.\n");
-            if (kmt_handle)
-                CloseHandle(handle);
-
+            WARN("Failed to read shared ID3D12Resource descriptor, hr %#x.\n", (int)hr);
             *object = NULL;
-            return E_INVALIDARG;
+            return hr;
         }
 
-        memset(&desc, 0, sizeof(desc));
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = metadata.Width;
-        desc.Height = metadata.Height;
-        desc.DepthOrArraySize = metadata.ArraySize;
-        desc.MipLevels = metadata.MipLevels;
-        desc.Format = metadata.Format;
-        desc.SampleDesc = metadata.SampleDesc;
-
-        switch (metadata.TextureLayout)
-        {
-            case D3D11_TEXTURE_LAYOUT_UNDEFINED: desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; break;
-            case D3D11_TEXTURE_LAYOUT_ROW_MAJOR: desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; break;
-            case D3D11_TEXTURE_LAYOUT_64K_STANDARD_SWIZZLE: desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE; break;
-            default: desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        }
-
-        if (metadata.BindFlags & D3D11_BIND_RENDER_TARGET)
-            desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-        if (metadata.BindFlags & D3D11_BIND_DEPTH_STENCIL)
-        {
-            desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-            if (!(metadata.BindFlags & D3D11_BIND_SHADER_RESOURCE))
-                desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
-        }
-        else
-            desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-
-        if (metadata.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
-            desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-
-        desc.SamplerFeedbackMipRegion.Width = 0;
-        desc.SamplerFeedbackMipRegion.Height = 0;
-        desc.SamplerFeedbackMipRegion.Depth = 0;
-
-        hr = d3d12_resource_create_committed(device, &desc, &heap_props,
-                D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource);
-        if (kmt_handle)
-            CloseHandle(handle);
-
-        if (FAILED(hr))
+        if (FAILED(hr = d3d12_resource_create_committed(device, &desc, &heap_props,
+                D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource)))
         {
             WARN("Failed to open shared ID3D12Resource, hr %#x.\n", (int)hr);
             *object = NULL;

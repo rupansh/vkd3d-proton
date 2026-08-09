@@ -108,10 +108,6 @@ if enable_descriptor_qa or enable_breadcrumbs
   vkd3d_src += ['debug_common.c']
 endif
 
-if vkd3d_platform == 'windows'
-  vkd3d_src += ['shared_metadata.c']
-endif
-
 if enable_profiling
   vkd3d_src += ['timestamp_profiler.c']
 endif

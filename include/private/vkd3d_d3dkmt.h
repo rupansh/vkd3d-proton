@@ -116,34 +116,12 @@ typedef struct _D3DKMT_DESTROYSYNCHRONIZATIONOBJECT
     D3DKMT_HANDLE hSyncObject;
 } D3DKMT_DESTROYSYNCHRONIZATIONOBJECT;
 
-typedef enum _D3DKMT_ESCAPETYPE
-{
-    D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE = 0x80000000
-} D3DKMT_ESCAPETYPE;
-
-typedef struct _D3DDDI_ESCAPEFLAGS
-{
-    union
-    {
-        struct
-        {
-            UINT HardwareAccess :1;
-            UINT Reserved       :31;
-        };
-        UINT Value;
-    };
-} D3DDDI_ESCAPEFLAGS;
-
-typedef struct _D3DKMT_ESCAPE
-{
-    D3DKMT_HANDLE      hAdapter;
-    D3DKMT_HANDLE      hDevice;
-    D3DKMT_ESCAPETYPE  Type;
-    D3DDDI_ESCAPEFLAGS Flags;
-    void              *pPrivateDriverData;
-    UINT               PrivateDriverDataSize;
-    D3DKMT_HANDLE      hContext;
-} D3DKMT_ESCAPE;
+/* Helios: D3DKMT_ESCAPETYPE / D3DDDI_ESCAPEFLAGS / D3DKMT_ESCAPE and the D3DKMTEscape
+ * import are deliberately absent. The Wine-private D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE
+ * (0x80000000) descriptor stamp was the fork's only Escape user; the retirement bars
+ * D3DKMTEscape for transport, discovery, metadata, synchronization, completion,
+ * lifetime, diagnostics and fallback, so shipped vkd3d must resolve no such symbol.
+ * Re-adding a declaration here re-opens that path - do not. */
 
 typedef struct _D3DKMT_OPENADAPTERFROMLUID
 {
@@ -355,7 +333,6 @@ EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTDestroyAllocation(const D3DKMT_DESTROY
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTDestroyDevice(const D3DKMT_DESTROYDEVICE *desc);
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTDestroyKeyedMutex(const D3DKMT_DESTROYKEYEDMUTEX *desc);
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTDestroySynchronizationObject(const D3DKMT_DESTROYSYNCHRONIZATIONOBJECT *desc);
-EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTEscape(const D3DKMT_ESCAPE *desc);
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(D3DKMT_OPENADAPTERFROMLUID *desc);
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenResource2(D3DKMT_OPENRESOURCE *desc);
 EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(D3DKMT_OPENRESOURCEFROMNTHANDLE *desc);

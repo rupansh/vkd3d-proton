@@ -7149,23 +7149,11 @@ typedef struct D3D11_TEXTURE3D_DESC
     UINT MiscFlags;
 } D3D11_TEXTURE3D_DESC;
 
-struct DxvkSharedTextureMetadata {
-    UINT             Width;
-    UINT             Height;
-    UINT             MipLevels;
-    UINT             ArraySize;
-    DXGI_FORMAT      Format;
-    DXGI_SAMPLE_DESC SampleDesc;
-    D3D11_USAGE      Usage;
-    UINT             BindFlags;
-    UINT             CPUAccessFlags;
-    UINT             MiscFlags;
-    D3D11_TEXTURE_LAYOUT TextureLayout;
-};
-
-bool vkd3d_set_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size);
-bool vkd3d_get_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size, uint32_t *metadata_size);
-HANDLE vkd3d_open_kmt_handle(HANDLE kmt_handle);
+/* Helios: struct DxvkSharedTextureMetadata and the vkd3d_{set,get}_shared_metadata /
+ * vkd3d_open_kmt_handle entry points are retired along with shared_metadata.c. Shared
+ * D3D12 resources are exported with CreateSharedHandle over the documented WDDM shared
+ * object and opened with the documented WDDM resource open; the \\.\SharedGpuResource
+ * device, its metadata IOCTLs and its open-by-name path are not a legal fallback. */
 
 #define VKD3D_VENDOR_ID_NVIDIA 0x10DE
 #define VKD3D_VENDOR_ID_AMD 0x1002

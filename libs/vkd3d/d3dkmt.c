@@ -138,62 +138,23 @@ void d3d12_resource_open_export_kmt(struct d3d12_resource *resource, struct d3d1
                 D3DKMTDestroySynchronizationObject(&destroy_sync);
             }
         }
+        else
+        {
+            /* Leaves kmt_local zero, which is now a hard refusal in CreateSharedHandle
+             * rather than a fall-through to the retired Wine-metadata export - say so
+             * here, where the cause is still visible. */
+            ERR("Failed to open exported resource %p as a WDDM shared object.\n", resource);
+        }
 
         CloseHandle(open.hNtHandle);
     }
 
-    if (resource->kmt_local)
-    {
-        struct d3dkmt_d3d12_desc desc = {0};
-        D3DKMT_ESCAPE escape = {0};
-
-        desc.d3d11.dxgi.size = sizeof(desc.d3d11);
-        desc.d3d11.dxgi.nt_shared = 1;
-        desc.desc1 = resource->desc;
-
-        if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-        {
-            desc.d3d11.dxgi.width = resource->desc.Width;
-            desc.d3d11.dxgi.height = resource->desc.Height;
-            desc.d3d11.dxgi.format = resource->desc.Format;
-
-            if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
-            {
-                desc.d3d11.dxgi.version = 4;
-                switch (resource->desc.Dimension)
-                {
-                    case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
-                        desc.d3d11.dimension = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
-                        desc.d3d11.d3d11_2d.Width = resource->desc.Width;
-                        desc.d3d11.d3d11_2d.Height = resource->desc.Height;
-                        desc.d3d11.d3d11_2d.MipLevels = resource->desc.MipLevels;
-                        desc.d3d11.d3d11_2d.ArraySize = resource->desc.DepthOrArraySize;
-                        desc.d3d11.d3d11_2d.Format = resource->desc.Format;
-                        desc.d3d11.d3d11_2d.SampleDesc = resource->desc.SampleDesc;
-                        desc.d3d11.d3d11_2d.Usage = D3D11_USAGE_DEFAULT;
-                        desc.d3d11.d3d11_2d.BindFlags = D3D11_BIND_RENDER_TARGET;
-                        if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-                            desc.d3d11.d3d11_2d.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
-                        if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-                            desc.d3d11.d3d11_2d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-                        if (!(resource->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
-                            desc.d3d11.d3d11_2d.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
-                        desc.d3d11.d3d11_2d.CPUAccessFlags = 0;
-                        desc.d3d11.d3d11_2d.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-                        break;
-                    default:
-                        WARN("Unsupported shared resource dimension %#x\n", resource->desc.Dimension);
-                        break;
-                }
-            }
-        }
-
-        escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;
-        escape.hContext = resource->kmt_local;
-        escape.pPrivateDriverData = &desc;
-        escape.PrivateDriverDataSize = sizeof(desc);
-        D3DKMTEscape(&escape);
-    }
+    /* Helios: nothing stamps a runtime descriptor onto the opened resource here.
+     * The Wine-private D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE update that used to run
+     * at this point is retired: D3DKMTEscape is forbidden for transport, metadata
+     * and every other purpose, and the shared resource's shape is fixed instead by
+     * the immutable create-time HWA2 allocation descriptor. A shape that cannot be
+     * described that way must fail at creation, never be patched up after open. */
 }
 
 void d3d12_resource_close_export_kmt(struct d3d12_resource *resource, struct d3d12_device *device)
