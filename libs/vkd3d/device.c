@@ -7643,14 +7643,15 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
         }
 
         status = D3DKMTShareObjects(1, &resource->kmt_local, &attr, access, handle);
-        ID3D12Resource_Release(resource_iface);
 
         if (status != STATUS_SUCCESS)
         {
             ERR("Failed to share resource %p, status %#x.\n", resource, (int)status);
+            ID3D12Resource_Release(resource_iface);
             return E_FAIL;
         }
 
+        ID3D12Resource_Release(resource_iface);
         return S_OK;
     }
 
