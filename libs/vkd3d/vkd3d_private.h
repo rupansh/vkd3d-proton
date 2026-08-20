@@ -162,6 +162,7 @@ struct vkd3d_vulkan_info
     bool KHR_dynamic_rendering_local_read;
     /* EXT device extensions */
     bool EXT_conditional_rendering;
+    bool EXT_buffer_device_address;
     bool EXT_conservative_rasterization;
     bool EXT_custom_border_color;
     bool EXT_depth_clip_enable;
@@ -255,6 +256,11 @@ struct vkd3d_instance
     struct vkd3d_vk_global_procs vk_global_procs;
 
     VkDebugUtilsMessengerEXT vk_debug_callback;
+
+    void *expected_vk_module;
+    bool owns_vk_instance;
+    bool singleton_member;
+    bool helios_record_only;
 
     LONG refcount;
 };
@@ -803,6 +809,7 @@ struct vkd3d_allocate_memory_info
     D3D12_HEAP_FLAGS heap_flags;
     void *host_ptr;
     const void *pNext;
+    bool helios_external_association;
     uint32_t flags;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
     VkMemoryPropertyFlags optional_memory_properties;
@@ -814,6 +821,7 @@ struct vkd3d_allocate_heap_memory_info
     D3D12_HEAP_DESC heap_desc;
     void *host_ptr;
     const void *pNext;
+    bool helios_external_association;
     uint32_t extra_allocation_flags;
     float vk_memory_priority;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
@@ -860,6 +868,12 @@ struct vkd3d_device_memory_allocation
     VkDeviceMemory vk_memory;
     uint32_t vk_memory_type;
     VkDeviceSize size;
+
+    /* Present only when record-only vkd3d asked the owning UMD to construct
+     * the exact standalone WDDM allocation for this VkDeviceMemory. */
+    uint64_t helios_device_generation;
+    uint64_t helios_outer_allocation_token;
+    bool helios_internal_association;
 };
 
 struct vkd3d_memory_allocation
@@ -874,6 +888,12 @@ struct vkd3d_memory_allocation
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
 
     uint64_t clear_semaphore_value;
+
+    /* Immutable Helios outer-allocation identity. Both fields are zero for
+     * ordinary allocations and both are nonzero for the package-owned
+     * record-only heap path. They are never handles or pointers. */
+    uint64_t helios_device_generation;
+    uint64_t helios_outer_allocation_token;
 
     struct vkd3d_memory_chunk *chunk;
 };
@@ -921,6 +941,7 @@ struct vkd3d_memory_transfer_info
     VkBuffer vk_buffer;
     VkDeviceSize vk_buffer_offset;
     VkDeviceSize vk_buffer_size;
+    struct vkd3d_memory_allocation *helios_allocation;
 
     struct d3d12_resource *resource;
     uint32_t subresource_idx;
@@ -966,6 +987,12 @@ struct vkd3d_memory_transfer_queue
 void vkd3d_memory_transfer_queue_cleanup(struct vkd3d_memory_transfer_queue *queue);
 HRESULT vkd3d_memory_transfer_queue_init(struct vkd3d_memory_transfer_queue *queue, struct d3d12_device *device);
 HRESULT vkd3d_memory_transfer_queue_flush(struct vkd3d_memory_transfer_queue *queue);
+bool vkd3d_memory_transfer_queue_has_pending(struct vkd3d_memory_transfer_queue *queue);
+HRESULT vkd3d_memory_transfer_queue_record_helios_clears(
+        struct vkd3d_memory_transfer_queue *queue, VkCommandBuffer vk_command_buffer);
+bool vkd3d_memory_transfer_queue_cancel_helios_clear(
+        struct vkd3d_memory_transfer_queue *queue,
+        const struct vkd3d_memory_allocation *allocation);
 HRESULT vkd3d_memory_transfer_queue_write_subresource(struct vkd3d_memory_transfer_queue *queue,
         struct d3d12_resource *resource, uint32_t subresource_idx, VkOffset3D offset, VkExtent3D extent);
 HRESULT vkd3d_memory_transfer_queue_build_empty_rtas(struct vkd3d_memory_transfer_queue *queue);
@@ -1049,6 +1076,10 @@ struct d3d12_heap
 
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
         void *host_address, struct d3d12_heap **heap);
+HRESULT d3d12_heap_create_with_pnext(struct d3d12_device *device,
+        const D3D12_HEAP_DESC *desc, void *host_address,
+        const void *allocation_pnext, uint64_t helios_device_generation,
+        uint64_t helios_outer_allocation_token, struct d3d12_heap **heap);
 HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties);
 
@@ -1328,7 +1359,8 @@ static inline struct d3d12_resource *impl_from_ID3D12Resource(ID3D12Resource *if
 
 HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
-        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation);
+        void *pNext, bool respect_budget, bool helios_external_association,
+        struct vkd3d_device_memory_allocation *allocation);
 void vkd3d_free_device_memory(struct d3d12_device *device,
         const struct vkd3d_device_memory_allocation *allocation);
 HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuffer vk_buffer,
@@ -3914,6 +3946,19 @@ struct d3d12_command_queue
     VkSemaphore serializing_semaphore;
     bool serializing_semaphore_signaled;
 
+    /* Immutable package-owned record-only association.  These callbacks are
+     * installed before the queue interface is published and are never changed
+     * during its lifetime.  They name the exact UMD runtime queue/context,
+     * rather than a process-global registry or a recoverable identity. */
+    bool helios_record_only;
+    void *helios_outer_context;
+    HRESULT (*helios_outer_begin)(void *context);
+    HRESULT (*helios_outer_finish)(void *context, VkResult submit_result);
+    HRESULT (*helios_outer_join)(void *context);
+    struct d3d12_command_queue_transition_pool *helios_transition_pool;
+    pthread_mutex_t helios_submit_mutex;
+    bool helios_submit_mutex_initialized;
+
     uint32_t inflight_submissions;
 
     struct
@@ -3941,6 +3986,9 @@ struct d3d12_command_queue
 
 HRESULT d3d12_command_queue_create(struct d3d12_device *device,
         const D3D12_COMMAND_QUEUE_DESC *desc, uint32_t vk_family_index, struct d3d12_command_queue **queue);
+HRESULT d3d12_command_queue_associate_helios(struct d3d12_command_queue *queue,
+        void *context, uintptr_t begin_address, uintptr_t finish_address,
+        uintptr_t join_address);
 void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue);
 void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_fence_iface *fence, uint64_t value);
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
@@ -5306,6 +5354,7 @@ struct vkd3d_physical_device_info
     /* features */
     VkPhysicalDeviceVulkan11Features vulkan_1_1_features;
     VkPhysicalDeviceVulkan12Features vulkan_1_2_features;
+    VkPhysicalDeviceBufferDeviceAddressFeaturesEXT buffer_device_address_features_ext;
     VkPhysicalDeviceVulkan13Features vulkan_1_3_features;
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_features;
@@ -5904,6 +5953,24 @@ struct d3d12_device
     } vendor_hacks;
 
     bool independent_device;
+
+    /* Immutable package construction edge used only by record-only Helios
+     * allocations. Allocation identity is always the explicit generation and
+     * token carried by vkd3d_memory_allocation, never this context pointer. */
+    void *helios_outer_context;
+    HRESULT (*helios_outer_allocation_create)(void *context,
+            uint64_t bytes, uint32_t cpu_visible, uint32_t device_local,
+            struct HeliosResourceAssociationV1 *association_out);
+    HRESULT (*helios_outer_allocation_teardown_begin)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token);
+    HRESULT (*helios_outer_allocation_begin)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token,
+            void **scope);
+    HRESULT (*helios_outer_allocation_finish)(void *context,
+            void *scope, VkResult lower_result);
+    HRESULT (*helios_outer_allocation_retire)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token,
+            VkResult teardown_result);
 };
 
 HRESULT d3d12_device_create(struct vkd3d_instance *instance,
@@ -6933,9 +7000,11 @@ static inline void debug_ignored_node_mask(unsigned int mask)
 HRESULT vkd3d_load_vk_global_procs(struct vkd3d_vk_global_procs *procs,
         PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr);
 HRESULT vkd3d_load_vk_instance_procs(struct vkd3d_vk_instance_procs *procs,
-        const struct vkd3d_vk_global_procs *global_procs, VkInstance instance);
+        const struct vkd3d_vk_global_procs *global_procs, VkInstance instance,
+        void *expected_vk_module);
 HRESULT vkd3d_load_vk_device_procs(struct vkd3d_vk_device_procs *procs,
-        const struct vkd3d_vk_instance_procs *parent_procs, VkDevice device);
+        const struct vkd3d_vk_instance_procs *parent_procs, VkDevice device,
+        void *expected_vk_module);
 
 HRESULT vkd3d_set_vk_object_name(struct d3d12_device *device, uint64_t vk_object,
         VkObjectType vk_object_type, const char *name);

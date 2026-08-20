@@ -39,6 +39,15 @@ static void d3d12_fence_iface_inc_ref(d3d12_fence_iface *iface);
 static void d3d12_fence_iface_dec_ref(d3d12_fence_iface *iface);
 static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator);
 static HRESULT d3d12_fence_signal_cpu_timeline_semaphore(struct d3d12_fence *fence, uint64_t value);
+static void d3d12_command_queue_transition_pool_deinit(
+        struct d3d12_command_queue_transition_pool *pool,
+        struct d3d12_device *device, bool wait);
+static HRESULT d3d12_command_queue_execute_record_only(
+        struct d3d12_command_queue *queue,
+        struct d3d12_command_queue_submission_execute *execute);
+static bool d3d12_command_queue_exec_submit_needs_fallback_queue(
+        struct d3d12_command_queue *queue,
+        const struct d3d12_command_queue_submission_execute *execute);
 
 /* This must be at least twice the number of texture region batches, since we must be able to resolve
  * a source + destination memory barrier per copy without incurring a barrier flush.
@@ -123,7 +132,7 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
     struct vkd3d_queue *object;
     VkDependencyInfo dep_info;
     VkResult vr;
-    HRESULT hr;
+    HRESULT hr = S_OK;
     int rc;
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
@@ -227,7 +236,9 @@ HRESULT vkd3d_queue_create(struct d3d12_device *device, uint32_t family_index, u
         VK_CALL(vkEndCommandBuffer(object->barrier_command_buffer));
     }
 
-    if (FAILED(hr = vkd3d_create_timeline_semaphore(device, 0, false, &object->submission_timeline)))
+    if (!device->vkd3d_instance->helios_record_only &&
+            FAILED(hr = vkd3d_create_timeline_semaphore(
+                    device, 0, false, &object->submission_timeline)))
         goto fail_free_command_pool;
 
     *queue = object;
@@ -266,6 +277,18 @@ void vkd3d_queue_drain(struct vkd3d_queue *queue, struct d3d12_device *device)
     VkSubmitInfo2 submit_desc;
     VkResult vr = VK_SUCCESS;
     VkQueue vk_queue;
+
+    /* The embedding UMD joins the exact outer HQC1 context before record-only
+     * device rundown. Re-entering the lower VkQueue here would create a second
+     * completion path and, since these queues own no submission timeline,
+     * cannot prove anything stronger. */
+    if (device->vkd3d_instance->helios_record_only)
+    {
+        if (queue->wait_count)
+            ERR("Record-only queue reached rundown with %u lower waits.\n", queue->wait_count);
+        queue->wait_count = 0;
+        return;
+    }
 
     if (!(vk_queue = vkd3d_queue_acquire(queue)))
     {
@@ -309,7 +332,8 @@ void vkd3d_queue_destroy(struct vkd3d_queue *queue, struct d3d12_device *device)
     size_t i;
 
     VK_CALL(vkDestroyCommandPool(device->vk_device, queue->barrier_pool, NULL));
-    VK_CALL(vkDestroySemaphore(device->vk_device, queue->submission_timeline, NULL));
+    if (queue->submission_timeline)
+        VK_CALL(vkDestroySemaphore(device->vk_device, queue->submission_timeline, NULL));
 
     pthread_mutex_destroy(&queue->mutex);
     pthread_mutex_destroy(&queue->command_queue_mutex);
@@ -22333,6 +22357,20 @@ ULONG STDMETHODCALLTYPE d3d12_command_queue_Release(ID3D12CommandQueue *iface)
         d3d12_command_queue_submit_stop(command_queue);
 
         pthread_join(command_queue->submission_thread, NULL);
+
+        /* The embedding UMD has joined the exact HQC1 context before dropping
+         * its engine queue.  Destruction may therefore release the private
+         * transition pool without introducing a lower Vulkan wait/timeline. */
+        if (command_queue->helios_transition_pool)
+        {
+            d3d12_command_queue_transition_pool_deinit(
+                    command_queue->helios_transition_pool, device, false);
+            vkd3d_free(command_queue->helios_transition_pool);
+            command_queue->helios_transition_pool = NULL;
+        }
+        if (command_queue->helios_submit_mutex_initialized)
+            pthread_mutex_destroy(&command_queue->helios_submit_mutex);
+
         pthread_mutex_destroy(&command_queue->queue_lock);
         pthread_cond_destroy(&command_queue->queue_cond);
 
@@ -22790,7 +22828,17 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     if (!command_list_count)
         return;
 
-    if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
+    if (command_queue->helios_record_only && command_list_count != 1)
+    {
+        d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_INVALID_CALL,
+                "Record-only ECL must preserve one runtime command-list association, got %u.\n",
+                command_list_count);
+        return;
+    }
+
+    if (!command_queue->helios_record_only &&
+            FAILED(hr = vkd3d_memory_transfer_queue_flush(
+                    &command_queue->device->memory_transfers)))
     {
         d3d12_device_mark_as_removed(command_queue->device, hr,
                 "Failed to execute pending memory clears.\n");
@@ -23166,7 +23214,16 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     sub.execute.breadcrumb_indices_count = breadcrumb_indices ? command_list_count : 0;
 #endif
     sub.execute.timeline_cookie = timeline_cookie;
-    d3d12_command_queue_add_submission(command_queue, &sub);
+    if (command_queue->helios_record_only)
+    {
+        if (FAILED(hr = d3d12_command_queue_execute_record_only(command_queue, &sub.execute)))
+            d3d12_device_mark_as_removed(command_queue->device, hr,
+                    "Record-only command-list association failed before outer submission.\n");
+    }
+    else
+    {
+        d3d12_command_queue_add_submission(command_queue, &sub);
+    }
 }
 
 static void STDMETHODCALLTYPE d3d12_command_queue_SetMarker(ID3D12CommandQueue *iface,
@@ -24008,10 +24065,13 @@ static HRESULT d3d12_command_queue_transition_pool_init(struct d3d12_command_que
     if ((vr = VK_CALL(vkAllocateCommandBuffers(queue->device->vk_device, &alloc_info, pool->cmd))))
         return hresult_from_vk_result(vr);
 
-    if (FAILED(hr = vkd3d_create_timeline_semaphore(queue->device, 0, false, &pool->timeline)))
+    if (!queue->device->vkd3d_instance->helios_record_only &&
+            FAILED(hr = vkd3d_create_timeline_semaphore(
+                    queue->device, 0, false, &pool->timeline)))
         return hr;
 
-    if ((queue->vkd3d_queue->vk_queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) ==
+    if (!queue->device->vkd3d_instance->helios_record_only &&
+        (queue->vkd3d_queue->vk_queue_flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) ==
         VK_QUEUE_TRANSFER_BIT &&
         !queue->device->concurrent_transfer_queue)
     {
@@ -24047,13 +24107,15 @@ static void d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_
 }
 
 static void d3d12_command_queue_transition_pool_deinit(struct d3d12_command_queue_transition_pool *pool,
-        struct d3d12_device *device)
+        struct d3d12_device *device, bool wait)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    d3d12_command_queue_transition_pool_wait(pool, device, pool->timeline_value);
+    if (wait && pool->timeline_value)
+        d3d12_command_queue_transition_pool_wait(pool, device, pool->timeline_value);
     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->pool, NULL));
     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->fallback_pool, NULL));
-    VK_CALL(vkDestroySemaphore(device->vk_device, pool->timeline, NULL));
+    if (pool->timeline)
+        VK_CALL(vkDestroySemaphore(device->vk_device, pool->timeline, NULL));
     vkd3d_free(pool->barriers);
     vkd3d_free((void*)pool->query_heaps);
 }
@@ -24118,10 +24180,11 @@ static void d3d12_command_queue_init_query_heap(struct d3d12_device *device, VkC
     }
 }
 
-static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue_transition_pool *pool,
-        struct d3d12_device *device, const struct vkd3d_initial_transition *transitions, size_t count,
+static HRESULT d3d12_command_queue_transition_pool_build(struct d3d12_command_queue_transition_pool *pool,
+        struct d3d12_command_queue *queue, const struct vkd3d_initial_transition *transitions, size_t count,
         bool fallback, VkCommandBuffer *vk_cmd_buffer, uint64_t *timeline_value)
 {
+    struct d3d12_device *device = queue->device;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     const struct vkd3d_initial_transition *transition;
     VkCommandBufferBeginInfo begin_info;
@@ -24130,6 +24193,8 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     uint32_t need_transition;
     VkCommandBuffer cmd;
     bool qa_checks;
+    bool helios_clears;
+    HRESULT hr;
     size_t i;
 
     pool->barriers_count = 0;
@@ -24137,11 +24202,13 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
 
 	qa_checks = VKD3D_CONFIG_FLAG_IS_SET(INSTRUCTION_QA_CHECKS) ||
 		VKD3D_CONFIG_FLAG_IS_SET(DESCRIPTOR_QA_CHECKS);
+    helios_clears = queue->helios_record_only &&
+            vkd3d_memory_transfer_queue_has_pending(&device->memory_transfers);
 
-    if (!qa_checks && !count)
+    if (!qa_checks && !count && !helios_clears)
     {
         *vk_cmd_buffer = VK_NULL_HANDLE;
-        return;
+        return S_OK;
     }
 
     for (i = 0; i < count; i++)
@@ -24171,10 +24238,11 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
         }
     }
 
-    if (!qa_checks && !pool->barriers_count && !pool->query_heaps_count)
+    if (!qa_checks && !pool->barriers_count && !pool->query_heaps_count &&
+            !helios_clears)
     {
         *vk_cmd_buffer = VK_NULL_HANDLE;
-        return;
+        return S_OK;
     }
 
     pool->timeline_value++;
@@ -24182,7 +24250,19 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     cmd = fallback ? pool->fallback_cmd[command_index] : pool->cmd[command_index];
 
     if (pool->timeline_value > VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS)
-        d3d12_command_queue_transition_pool_wait(pool, device, pool->timeline_value - VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS);
+    {
+        if (queue->helios_record_only)
+        {
+            HRESULT hr = queue->helios_outer_join(queue->helios_outer_context);
+            if (FAILED(hr))
+                return hr;
+        }
+        else
+        {
+            d3d12_command_queue_transition_pool_wait(pool, device,
+                    pool->timeline_value - VKD3D_COMMAND_QUEUE_NUM_TRANSITION_BUFFERS);
+        }
+    }
 
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.pNext = NULL;
@@ -24218,10 +24298,18 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
 
     for (i = 0; i < pool->query_heaps_count; i++)
         d3d12_command_queue_init_query_heap(device, cmd, pool->query_heaps[i]);
+    if (helios_clears && FAILED(hr =
+            vkd3d_memory_transfer_queue_record_helios_clears(
+                    &device->memory_transfers, cmd)))
+    {
+        VK_CALL(vkEndCommandBuffer(cmd));
+        return hr;
+    }
     VK_CALL(vkEndCommandBuffer(cmd));
 
     *vk_cmd_buffer = cmd;
     *timeline_value = pool->timeline_value;
+    return S_OK;
 }
 
 static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_device *device,
@@ -24389,13 +24477,29 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
     VkQueue vk_queue;
     unsigned int i;
     bool fallback;
-    VkResult vr;
+    VkResult vr = VK_SUCCESS;
     HRESULT hr;
 
     TRACE("queue %p, command_list_count %u, command_lists %p.\n",
           command_queue, exec->cmd_count, exec->cmd);
 
-    stagger_submissions = d3d12_command_queue_needs_staggered_submissions(command_queue);
+    stagger_submissions = command_queue->helios_record_only ? false :
+            d3d12_command_queue_needs_staggered_submissions(command_queue);
+
+    if (command_queue->helios_record_only &&
+            (!command_queue->helios_outer_begin || !command_queue->helios_outer_finish ||
+            !command_queue->helios_outer_join || exec->split_submission || !exec->cmd_count ||
+            d3d12_command_queue_exec_submit_needs_fallback_queue(command_queue, exec)))
+    {
+        d3d12_device_mark_as_removed(command_queue->device, E_NOTIMPL,
+                "Record-only queue refused incomplete association, split, or fallback submit.\n");
+        for (i = 0; i < exec->num_command_allocators; i++)
+            d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
+        vkd3d_free(exec->command_allocators);
+        vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
+                NULL, exec->timeline_cookie);
+        return;
+    }
 
     if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
     {
@@ -24443,8 +24547,11 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
          * to know when we can reset the barrier command buffer. */
         submit = &submit_desc[num_submits++];
         submit->sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-        submit->signalSemaphoreInfoCount = 1;
-        submit->pSignalSemaphoreInfos = transition_semaphore;
+        if (!command_queue->helios_record_only)
+        {
+            submit->signalSemaphoreInfoCount = 1;
+            submit->pSignalSemaphoreInfos = transition_semaphore;
+        }
         submit->commandBufferInfoCount = 1;
         submit->pCommandBufferInfos = transition_cmd;
 
@@ -24480,10 +24587,13 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         fallback = serialize_transition;
 
         memset(signal_semaphore_infos, 0, sizeof(signal_semaphore_infos));
-        signal_semaphore_infos[0].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-        signal_semaphore_infos[0].semaphore = vkd3d_queue->submission_timeline;
-        signal_semaphore_infos[0].value = ++vkd3d_queue->submission_timeline_count;
-        signal_semaphore_infos[0].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        if (!command_queue->helios_record_only)
+        {
+            signal_semaphore_infos[0].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+            signal_semaphore_infos[0].semaphore = vkd3d_queue->submission_timeline;
+            signal_semaphore_infos[0].value = ++vkd3d_queue->submission_timeline_count;
+            signal_semaphore_infos[0].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        }
 
         /* If the init command buffer is on fallback queue, we need to run it in isolation. */
         if (serialize_transition)
@@ -24533,14 +24643,18 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         submit->sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
         submit->commandBufferInfoCount = cmd_count;
         submit->pCommandBufferInfos = &exec->cmd[cmd_index];
-        submit->signalSemaphoreInfoCount = 1;
-        submit->pSignalSemaphoreInfos = signal_semaphore_infos;
+        if (!command_queue->helios_record_only)
+        {
+            submit->signalSemaphoreInfoCount = 1;
+            submit->pSignalSemaphoreInfos = signal_semaphore_infos;
+        }
 
         /* Clear out any shenanigans we added due to fallback submit. */
         for (i = 0; i < cmd_count; i++)
             exec->cmd[cmd_index + i].deviceMask = 0;
 
-        if (transition_cmd->commandBuffer && is_first)
+        if (!command_queue->helios_record_only &&
+                transition_cmd->commandBuffer && is_first)
         {
             submit->waitSemaphoreInfoCount = 1;
             submit->pWaitSemaphoreInfos = transition_semaphore;
@@ -24590,12 +24704,21 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
             vkd3d_queue_timeline_trace_begin_execute_overhead(&command_queue->device->queue_timeline_trace, exec->timeline_cookie);
             d3d12_command_queue_gather_wait_semaphores_locked(command_queue, &submit_desc[0],
                   VKD3D_WAIT_SEMAPHORES_EXTERNAL | VKD3D_WAIT_SEMAPHORES_SERIALIZING);
+            if (command_queue->helios_record_only &&
+                    submit_desc[0].waitSemaphoreInfoCount)
+            {
+                vr = VK_ERROR_DEVICE_LOST;
+                d3d12_device_mark_as_removed(command_queue->device, E_NOTIMPL,
+                        "Record-only queue refused %u lower semaphore waits.\n",
+                        submit_desc[0].waitSemaphoreInfoCount);
+            }
         }
 
         /* Prefer binary semaphore since timeline signal -> wait pair can cause scheduling bubbles.
          * Binary semaphores tend to be more well-behaved here since they can lower to kernel primitives
          * more easily. Must happen after setting up waits to track the binary semaphore state correctly. */
-        if (command_queue->serializing_semaphore && is_last)
+        if (!command_queue->helios_record_only &&
+                command_queue->serializing_semaphore && is_last)
         {
             binary_semaphore_info = &signal_semaphore_infos[submit->signalSemaphoreInfoCount++];
             binary_semaphore_info->sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -24607,9 +24730,49 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
          * in a submit is not a fallback submit. */
         assert(!is_last || command_queue->serializing_semaphore || !fallback);
 
-        proxy_fence = vkd3d_queue_get_signal_fence_proxy_locked(vkd3d_queue);
+        proxy_fence = command_queue->helios_record_only ? VK_NULL_HANDLE :
+                vkd3d_queue_get_signal_fence_proxy_locked(vkd3d_queue);
 
-        if (fallback)
+        if (command_queue->helios_record_only)
+        {
+            HRESULT outer_hr;
+
+            /* The one record-only iteration contains the optional transition
+             * submit and this association's command buffers in one Vulkan call.
+             * The immutable begin/finish edge keeps the entire direct Mesa
+             * seal within the same runtime ECL thread. */
+            assert(is_first && is_last && !fallback && !exec->split_submission);
+            if (vr != VK_SUCCESS)
+            {
+                /* The lower wait was refused before an outer scope opened. */
+            }
+            else if (FAILED(outer_hr = command_queue->helios_outer_begin(
+                    command_queue->helios_outer_context)))
+            {
+                vr = VK_ERROR_DEVICE_LOST;
+                d3d12_device_mark_as_removed(command_queue->device, outer_hr,
+                        "Record-only outer scope begin failed.\n");
+            }
+            else
+            {
+                vr = VK_CALL(vkQueueSubmit2(vk_queue, num_submits,
+                        submit_desc, proxy_fence));
+                outer_hr = command_queue->helios_outer_finish(
+                        command_queue->helios_outer_context, vr);
+                if (FAILED(outer_hr))
+                {
+                    if (vr == VK_SUCCESS)
+                        vr = VK_ERROR_DEVICE_LOST;
+                    d3d12_device_mark_as_removed(command_queue->device, outer_hr,
+                            "Record-only outer scope finish failed.\n");
+                }
+                else if (vr < 0)
+                {
+                    ERR("Record-only vkQueueSubmit2 refused the association, vr %d.\n", vr);
+                }
+            }
+        }
+        else if (fallback)
         {
             VkQueue vk_fallback_queue;
             vr = VK_ERROR_DEVICE_LOST;
@@ -24642,7 +24805,9 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         /* If serializing binary semaphore is not used, the serializing command buffer is always executed on the expected
          * queue at the end. If it is used, the last fallback queue submission signals the binary semaphore,
          * so it will serialize with next queue submission that is on the proper queue. */
-        command_queue->serializing_semaphore_signaled = command_queue->serializing_semaphore && is_last;
+        command_queue->serializing_semaphore_signaled =
+                !command_queue->helios_record_only &&
+                command_queue->serializing_semaphore && is_last;
         need_fallback_wait_semaphore = fallback;
 
         memset(submit_desc, 0, sizeof(submit_desc));
@@ -24665,7 +24830,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         }
 
         /* Update timeline value *after* waiting for staggered submissions */
-        command_queue->last_submission_timeline_value = signal_semaphore_infos[0].value;
+        if (!command_queue->helios_record_only)
+            command_queue->last_submission_timeline_value = signal_semaphore_infos[0].value;
         is_first = false;
         serialize_transition = false;
     }
@@ -24686,7 +24852,16 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
      *   If there are pending submissions waiting, we are expected to ignore the reset.
      *   We will report a failure in this case. Some games run into this.
      */
-    if (vr == VK_SUCCESS && exec->num_command_allocators)
+    if (command_queue->helios_record_only && exec->num_command_allocators)
+    {
+        for (i = 0; i < exec->num_command_allocators; i++)
+            d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
+        vkd3d_free(exec->command_allocators);
+        vkd3d_queue_timeline_trace_complete_execute(
+                &command_queue->device->queue_timeline_trace,
+                NULL, exec->timeline_cookie);
+    }
+    else if (vr == VK_SUCCESS && exec->num_command_allocators)
     {
         memset(&fence_info, 0, sizeof(fence_info));
         fence_info.vk_semaphore = vkd3d_queue->submission_timeline;
@@ -24697,11 +24872,67 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         submission_info->command_allocators = exec->command_allocators;
         submission_info->num_command_allocators = exec->num_command_allocators;
 
-        if (FAILED(hr = vkd3d_enqueue_timeline_semaphore(&command_queue->fence_worker, &fence_info, &exec->timeline_cookie)))
-        {
+        if (FAILED(hr = vkd3d_enqueue_timeline_semaphore(
+                &command_queue->fence_worker, &fence_info,
+                &exec->timeline_cookie)))
             ERR("Failed to enqueue timeline semaphore.\n");
-        }
     }
+}
+
+static HRESULT d3d12_command_queue_execute_record_only(
+        struct d3d12_command_queue *queue,
+        struct d3d12_command_queue_submission_execute *execute)
+{
+    VkSemaphoreSubmitInfo transition_semaphore;
+    VkCommandBufferSubmitInfo transition_cmd;
+    HRESULT hr = S_OK;
+    unsigned int i;
+
+    if (!queue->helios_transition_pool || !queue->helios_submit_mutex_initialized)
+        return E_FAIL;
+    if (pthread_mutex_lock(&queue->helios_submit_mutex))
+        return E_FAIL;
+
+    memset(&transition_cmd, 0, sizeof(transition_cmd));
+    transition_cmd.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    memset(&transition_semaphore, 0, sizeof(transition_semaphore));
+    transition_semaphore.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    transition_semaphore.semaphore = queue->helios_transition_pool->timeline;
+    transition_semaphore.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    if (d3d12_command_queue_exec_submit_needs_fallback_queue(queue, execute))
+    {
+        hr = E_NOTIMPL;
+        goto fail_before_execute;
+    }
+
+    hr = d3d12_command_queue_transition_pool_build(
+            queue->helios_transition_pool, queue, execute->transitions,
+            execute->transition_count, false, &transition_cmd.commandBuffer,
+            &transition_semaphore.value);
+    if (FAILED(hr))
+        goto fail_before_execute;
+
+    d3d12_command_queue_execute(queue, execute, &transition_cmd,
+            &transition_semaphore);
+    goto cleanup;
+
+fail_before_execute:
+    for (i = 0; i < execute->num_command_allocators; i++)
+        d3d12_command_allocator_dec_ref(execute->command_allocators[i]);
+    vkd3d_free(execute->command_allocators);
+    vkd3d_queue_timeline_trace_complete_execute(&queue->device->queue_timeline_trace,
+            NULL, execute->timeline_cookie);
+
+cleanup:
+    vkd3d_free(execute->cmd);
+    vkd3d_free(execute->cmd_cost);
+    vkd3d_free(execute->transitions);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+    vkd3d_free(execute->breadcrumb_indices);
+#endif
+    pthread_mutex_unlock(&queue->helios_submit_mutex);
+    return hr;
 }
 
 static unsigned int vkd3d_compact_sparse_bind_ranges(const struct d3d12_resource *src_resource,
@@ -25232,7 +25463,7 @@ void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_
 
 static bool d3d12_command_queue_exec_submit_needs_fallback_queue(
         struct d3d12_command_queue *queue,
-        struct d3d12_command_queue_submission_execute *execute)
+        const struct d3d12_command_queue_submission_execute *execute)
 {
     unsigned int i;
 
@@ -25332,7 +25563,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
             if (d3d12_command_queue_exec_submit_needs_fallback_queue(queue, &submission.execute))
                 transition_cmd.deviceMask = VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE;
 
-            d3d12_command_queue_transition_pool_build(&pool, queue->device,
+            d3d12_command_queue_transition_pool_build(&pool, queue,
                     submission.execute.transitions,
                     submission.execute.transition_count,
                     transition_cmd.deviceMask != VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_DEFAULT,
@@ -25410,7 +25641,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
 
 cleanup:
     d3d12_command_queue_wait_idle(queue);
-    d3d12_command_queue_transition_pool_deinit(&pool, queue->device);
+    d3d12_command_queue_transition_pool_deinit(&pool, queue->device, true);
     d3d12_command_queue_destroy_serializing_semaphore(queue);
     return NULL;
 }
@@ -25531,6 +25762,45 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
     return S_OK;
 }
 
+HRESULT d3d12_command_queue_associate_helios(struct d3d12_command_queue *queue,
+        void *context, uintptr_t begin_address, uintptr_t finish_address,
+        uintptr_t join_address)
+{
+    struct d3d12_command_queue_transition_pool *pool;
+    HRESULT hr;
+    int rc;
+
+    if (!queue || !context || !begin_address || !finish_address || !join_address)
+        return E_INVALIDARG;
+    if (!queue->device->vkd3d_instance->helios_record_only ||
+            queue->helios_record_only || queue->helios_transition_pool)
+        return E_FAIL;
+
+    if (!(pool = vkd3d_calloc(1, sizeof(*pool))))
+        return E_OUTOFMEMORY;
+    if ((rc = pthread_mutex_init(&queue->helios_submit_mutex, NULL)) < 0)
+    {
+        vkd3d_free(pool);
+        return hresult_from_errno(rc);
+    }
+    queue->helios_submit_mutex_initialized = true;
+    if (FAILED(hr = d3d12_command_queue_transition_pool_init(pool, queue)))
+    {
+        pthread_mutex_destroy(&queue->helios_submit_mutex);
+        queue->helios_submit_mutex_initialized = false;
+        vkd3d_free(pool);
+        return hr;
+    }
+
+    queue->helios_outer_context = context;
+    queue->helios_outer_begin = (HRESULT (*)(void *))begin_address;
+    queue->helios_outer_finish = (HRESULT (*)(void *, VkResult))finish_address;
+    queue->helios_outer_join = (HRESULT (*)(void *))join_address;
+    queue->helios_transition_pool = pool;
+    queue->helios_record_only = true;
+    return S_OK;
+}
+
 uint32_t vkd3d_get_vk_queue_family_index(ID3D12CommandQueue *queue)
 {
     struct d3d12_command_queue *d3d12_queue = impl_from_ID3D12CommandQueue(queue);
@@ -25562,6 +25832,12 @@ VkQueue vkd3d_acquire_vk_queue(ID3D12CommandQueue *queue)
     VKD3D_REGION_DECL(acquire_vk_queue);
     VKD3D_REGION_BEGIN(acquire_vk_queue);
     d3d12_queue = impl_from_ID3D12CommandQueue(queue);
+    if (d3d12_queue->helios_record_only)
+    {
+        ERR("Record-only queues cannot be drained or externally submitted.\n");
+        VKD3D_REGION_END(acquire_vk_queue);
+        return VK_NULL_HANDLE;
+    }
     d3d12_command_queue_acquire_serialized(d3d12_queue);
     vk_queue = vkd3d_queue_acquire(d3d12_queue->vkd3d_queue);
     VKD3D_REGION_END(acquire_vk_queue);
@@ -25576,6 +25852,12 @@ VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue)
 
     VKD3D_REGION_DECL(lock_vk_queue);
     VKD3D_REGION_BEGIN(lock_vk_queue);
+    if (d3d12_queue->helios_record_only)
+    {
+        ERR("Record-only queues cannot expose a lower VkQueue.\n");
+        VKD3D_REGION_END(lock_vk_queue);
+        return VK_NULL_HANDLE;
+    }
     vk_queue = vkd3d_queue_acquire(d3d12_queue->vkd3d_queue);
     VKD3D_REGION_END(lock_vk_queue);
     return vk_queue;

@@ -20,6 +20,7 @@
 
 #include "vkd3d_private.h"
 #include "vkd3d_descriptor_debug.h"
+#include "helios_resource_association.h"
 
 static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_transfer_queue *queue,
         uint64_t wait_value, uint64_t timeout);
@@ -114,6 +115,16 @@ void vkd3d_memory_transfer_queue_cleanup(struct vkd3d_memory_transfer_queue *que
 {
     const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
 
+    if (queue->device->vkd3d_instance->helios_record_only)
+    {
+        if (queue->tracked_resource_count)
+            ERR("Record-only memory queue retained tracked lower resources.\n");
+        vkd3d_free(queue->tracked_resources);
+        vkd3d_free(queue->transfers);
+        pthread_mutex_destroy(&queue->mutex);
+        return;
+    }
+
     pthread_mutex_lock(&queue->mutex);
     vkd3d_memory_transfer_queue_track_resource_locked(queue, NULL, 0);
     pthread_mutex_unlock(&queue->mutex);
@@ -152,6 +163,12 @@ HRESULT vkd3d_memory_transfer_queue_init(struct vkd3d_memory_transfer_queue *que
 
     if ((rc = pthread_mutex_init(&queue->mutex, NULL)))
         return hresult_from_errno(rc);
+
+    /* Record-only devices use this object solely as a bounded list of exact
+     * associated zero-clears. The first owning ECL records those commands in
+     * its outer batch, so no worker, command pool, VkQueue or semaphore exists. */
+    if (device->vkd3d_instance->helios_record_only)
+        return S_OK;
 
     if ((rc = pthread_cond_init(&queue->cond, NULL)))
     {
@@ -505,7 +522,8 @@ static void vkd3d_memory_transfer_queue_execute_transfer_locked(struct vkd3d_mem
     if (transfer->vk_buffer)
         queue->num_bytes_pending += transfer->vk_buffer_size;
 
-    if (queue->num_bytes_pending >= VKD3D_MEMORY_TRANSFER_QUEUE_MAX_PENDING_BYTES)
+    if (queue->num_bytes_pending >= VKD3D_MEMORY_TRANSFER_QUEUE_MAX_PENDING_BYTES &&
+            !queue->device->vkd3d_instance->helios_record_only)
         vkd3d_memory_transfer_queue_flush_locked(queue);
 }
 
@@ -550,6 +568,7 @@ static void vkd3d_memory_transfer_queue_fill_allocation(struct vkd3d_memory_tran
         transfer.vk_buffer = allocation->resource.vk_buffer;
         transfer.vk_buffer_offset = allocation->offset;
         transfer.vk_buffer_size = allocation->resource.size;
+        transfer.helios_allocation = allocation;
         transfer.fill_value = value * 0x01010101u;
 
         vkd3d_memory_transfer_queue_execute_transfer_locked(queue, &transfer);
@@ -557,10 +576,112 @@ static void vkd3d_memory_transfer_queue_fill_allocation(struct vkd3d_memory_tran
     }
 }
 
+bool vkd3d_memory_transfer_queue_has_pending(struct vkd3d_memory_transfer_queue *queue)
+{
+    bool pending;
+
+    pthread_mutex_lock(&queue->mutex);
+    pending = queue->transfer_count != 0;
+    pthread_mutex_unlock(&queue->mutex);
+    return pending;
+}
+
+#define VKD3D_HELIOS_MAX_ASSOCIATED_CLEARS 4096u
+
+HRESULT vkd3d_memory_transfer_queue_record_helios_clears(
+        struct vkd3d_memory_transfer_queue *queue, VkCommandBuffer vk_command_buffer)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &queue->device->vk_procs;
+    VkMemoryBarrier2 memory_barrier;
+    VkDependencyInfo dependency_info;
+    size_t i;
+
+    pthread_mutex_lock(&queue->mutex);
+    if (!queue->transfer_count ||
+            queue->transfer_count > VKD3D_HELIOS_MAX_ASSOCIATED_CLEARS)
+    {
+        pthread_mutex_unlock(&queue->mutex);
+        return E_INVALIDARG;
+    }
+    for (i = 0; i < queue->transfer_count; i++)
+    {
+        const struct vkd3d_memory_transfer_info *transfer = &queue->transfers[i];
+        if (transfer->op != VKD3D_MEMORY_TRANSFER_OP_CLEAR_ALLOCATION ||
+                !transfer->helios_allocation ||
+                !transfer->helios_allocation->helios_device_generation ||
+                !transfer->helios_allocation->helios_outer_allocation_token ||
+                transfer->helios_allocation->clear_semaphore_value != queue->next_signal_value ||
+                !transfer->vk_buffer || !transfer->vk_buffer_size || transfer->fill_value)
+        {
+            pthread_mutex_unlock(&queue->mutex);
+            return E_NOTIMPL;
+        }
+    }
+
+    for (i = 0; i < queue->transfer_count; i++)
+    {
+        const struct vkd3d_memory_transfer_info *transfer = &queue->transfers[i];
+        VK_CALL(vkCmdFillBuffer(vk_command_buffer, transfer->vk_buffer,
+                transfer->vk_buffer_offset, transfer->vk_buffer_size, 0));
+    }
+    memset(&memory_barrier, 0, sizeof(memory_barrier));
+    memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    memory_barrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    memory_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    memory_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    memory_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
+            VK_ACCESS_2_MEMORY_WRITE_BIT;
+    memset(&dependency_info, 0, sizeof(dependency_info));
+    dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency_info.memoryBarrierCount = 1;
+    dependency_info.pMemoryBarriers = &memory_barrier;
+    VK_CALL(vkCmdPipelineBarrier2(vk_command_buffer, &dependency_info));
+
+    for (i = 0; i < queue->transfer_count; i++)
+        queue->transfers[i].helios_allocation->clear_semaphore_value = 0;
+    queue->transfer_count = 0;
+    queue->num_bytes_pending = 0;
+    pthread_mutex_unlock(&queue->mutex);
+    return S_OK;
+}
+
+bool vkd3d_memory_transfer_queue_cancel_helios_clear(
+        struct vkd3d_memory_transfer_queue *queue,
+        const struct vkd3d_memory_allocation *allocation)
+{
+    size_t i;
+
+    if (!allocation->clear_semaphore_value)
+        return true;
+    pthread_mutex_lock(&queue->mutex);
+    for (i = 0; i < queue->transfer_count; i++)
+    {
+        struct vkd3d_memory_transfer_info *transfer = &queue->transfers[i];
+        if (transfer->op == VKD3D_MEMORY_TRANSFER_OP_CLEAR_ALLOCATION &&
+                transfer->helios_allocation == allocation &&
+                transfer->vk_buffer == allocation->resource.vk_buffer &&
+                transfer->vk_buffer_offset == allocation->offset &&
+                transfer->vk_buffer_size == allocation->resource.size &&
+                allocation->clear_semaphore_value == queue->next_signal_value)
+        {
+            queue->num_bytes_pending -= transfer->vk_buffer_size;
+            transfer->helios_allocation->clear_semaphore_value = 0;
+            queue->transfers[i] = queue->transfers[--queue->transfer_count];
+            pthread_mutex_unlock(&queue->mutex);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&queue->mutex);
+    return false;
+}
+
 HRESULT vkd3d_memory_transfer_queue_write_subresource(struct vkd3d_memory_transfer_queue *queue,
         struct d3d12_resource *resource, uint32_t subresource_idx, VkOffset3D offset, VkExtent3D extent)
 {
     struct vkd3d_memory_transfer_info transfer;
+
+    if (queue->device->vkd3d_instance->helios_record_only)
+        return E_NOTIMPL;
 
     memset(&transfer, 0, sizeof(transfer));
     transfer.op = VKD3D_MEMORY_TRANSFER_OP_WRITE_SUBRESOURCE;
@@ -578,6 +699,9 @@ HRESULT vkd3d_memory_transfer_queue_write_subresource(struct vkd3d_memory_transf
 HRESULT vkd3d_memory_transfer_queue_build_empty_rtas(struct vkd3d_memory_transfer_queue *queue)
 {
     struct vkd3d_memory_transfer_info transfer;
+
+    if (queue->device->vkd3d_instance->helios_record_only)
+        return E_NOTIMPL;
 
     memset(&transfer, 0, sizeof(transfer));
     transfer.op = VKD3D_MEMORY_TRANSFER_OP_BUILD_NULL_RTAS;
@@ -845,10 +969,64 @@ static void vkd3d_report_memory_budget(struct d3d12_device *device)
     }
 }
 
+static HRESULT vkd3d_helios_internal_teardown_begin(struct d3d12_device *device,
+        uint64_t device_generation, uint64_t outer_allocation_token, void **scope,
+        HRESULT *outer_begin_result)
+{
+    HRESULT hr;
+
+    *scope = NULL;
+    *outer_begin_result = E_FAIL;
+    if (!device_generation || !outer_allocation_token ||
+            !device->helios_outer_context ||
+            !device->helios_outer_allocation_teardown_begin ||
+            !device->helios_outer_allocation_begin ||
+            !device->helios_outer_allocation_finish ||
+            !device->helios_outer_allocation_retire)
+        return E_FAIL;
+
+    hr = device->helios_outer_allocation_teardown_begin(
+            device->helios_outer_context, device_generation,
+            outer_allocation_token);
+    if (hr != S_OK)
+        return hr;
+
+    hr = device->helios_outer_allocation_begin(device->helios_outer_context,
+            device_generation, outer_allocation_token, scope);
+    if ((hr != S_OK && hr != S_FALSE) ||
+            (hr == S_OK && !*scope) || (hr == S_FALSE && *scope))
+        return E_FAIL;
+
+    *outer_begin_result = hr;
+    return S_OK;
+}
+
+static HRESULT vkd3d_helios_internal_teardown_finish(struct d3d12_device *device,
+        uint64_t device_generation, uint64_t outer_allocation_token,
+        void *scope, HRESULT outer_begin_result)
+{
+    VkResult teardown_result = VK_SUCCESS;
+    HRESULT hr;
+
+    if (outer_begin_result == S_OK)
+    {
+        hr = device->helios_outer_allocation_finish(
+                device->helios_outer_context, scope, VK_SUCCESS);
+        if (FAILED(hr))
+            teardown_result = VK_ERROR_DEVICE_LOST;
+    }
+
+    hr = device->helios_outer_allocation_retire(device->helios_outer_context,
+            device_generation, outer_allocation_token, teardown_result);
+    return teardown_result == VK_SUCCESS && SUCCEEDED(hr) ? S_OK : E_FAIL;
+}
+
 void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_device_memory_allocation *allocation)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDeviceSize *type_current;
+    HRESULT begin_hr = S_FALSE;
+    void *helios_scope = NULL;
     bool rebar_budget;
 
     if (allocation->vk_memory == VK_NULL_HANDLE)
@@ -857,7 +1035,29 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
         return;
     }
 
+    if (allocation->helios_internal_association &&
+            FAILED(vkd3d_helios_internal_teardown_begin(device,
+                    allocation->helios_device_generation,
+                    allocation->helios_outer_allocation_token,
+                    &helios_scope, &begin_hr)))
+    {
+        d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                "Helios internal allocation teardown begin");
+        begin_hr = E_FAIL;
+    }
+
     VK_CALL(vkFreeMemory(device->vk_device, allocation->vk_memory, NULL));
+
+    if (allocation->helios_internal_association &&
+            (begin_hr == S_OK || begin_hr == S_FALSE) &&
+            FAILED(vkd3d_helios_internal_teardown_finish(device,
+                    allocation->helios_device_generation,
+                    allocation->helios_outer_allocation_token,
+                    helios_scope, begin_hr)))
+    {
+        d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                "Helios internal allocation teardown completion");
+    }
     rebar_budget = !!(device->memory_info.rebar_budget_mask & (1u << allocation->vk_memory_type));
 
     if (rebar_budget || VKD3D_CONFIG_FLAG_IS_SET(LOG_MEMORY_BUDGET))
@@ -894,16 +1094,25 @@ void vkd3d_free_device_memory(struct d3d12_device *device, const struct vkd3d_de
 
 static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, const uint32_t base_type_mask,
-        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool respect_budget, bool helios_external_association,
+        struct vkd3d_device_memory_allocation *allocation)
 {
     const VkPhysicalDeviceMemoryProperties *memory_props = &device->memory_properties;
     uint32_t type_mask, device_local_mask, candidate_mask, heap_index;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_memory_info *memory_info = &device->memory_info;
+    HeliosResourceAssociationV1 helios_association;
     VkDeviceSize *type_current, heap_size;
     VkMemoryAllocateInfo allocate_info;
-    bool rebar_budget;
+    VkMemoryPropertyFlags selected_properties;
+    bool rebar_budget, helios_internal_association;
+    HRESULT hr;
     VkResult vr;
+
+    allocation->helios_device_generation = 0;
+    allocation->helios_outer_allocation_token = 0;
+    allocation->helios_internal_association = false;
+    helios_internal_association = false;
 
     device_local_mask = 0u;
     candidate_mask = 0u;
@@ -952,7 +1161,8 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
         {
             return vkd3d_try_allocate_device_memory(device, size,
                     type_flags & ~optional_flags,
-                    base_type_mask, pNext, respect_budget, allocation);
+                    base_type_mask, pNext, respect_budget,
+                    helios_external_association, allocation);
         }
         else
         {
@@ -1019,10 +1229,82 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
                 allocate_info.allocationSize, device->device_info.vulkan_1_1_properties.maxMemoryAllocationSize);
     }
 
+    if (device->vkd3d_instance->helios_record_only && !helios_external_association)
+    {
+        bool has_cpu_mapping;
+        uintptr_t cpu_mapping;
+
+        selected_properties = memory_props->memoryTypes[
+                allocate_info.memoryTypeIndex].propertyFlags;
+        memset(&helios_association, 0, sizeof(helios_association));
+        hr = device->helios_outer_allocation_create(
+                device->helios_outer_context, size,
+                !!(selected_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+                !!(selected_properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                &helios_association);
+        has_cpu_mapping = !!(helios_association.association_flags &
+                HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING);
+        cpu_mapping = (uintptr_t)helios_association.cpu_mapping;
+        if (hr != S_OK ||
+                helios_association.s_type != HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE ||
+                helios_association.struct_bytes != HELIOS_RESOURCE_ASSOCIATION_BYTES ||
+                helios_association.p_next ||
+                helios_association.abi_version != HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION ||
+                helios_association.reserved ||
+                helios_association.package_generation != HELIOS_PACKAGE_GENERATION ||
+                !helios_association.device_generation ||
+                !helios_association.outer_allocation_token ||
+                helios_association.outer_allocation_bytes != size ||
+                (helios_association.association_flags &
+                        ~HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK) ||
+                helios_association.reserved1 ||
+                (!!helios_association.cpu_mapping != has_cpu_mapping) ||
+                (!!(selected_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) !=
+                        has_cpu_mapping) ||
+                (has_cpu_mapping && ((cpu_mapping & 4095u) ||
+                        helios_association.outer_allocation_bytes >
+                                UINTPTR_MAX - cpu_mapping)))
+        {
+            ERR("Record-only internal allocation association was refused or malformed.\n");
+            if (hr == S_OK && helios_association.device_generation &&
+                    helios_association.outer_allocation_token)
+            {
+                void *scope;
+                HRESULT outer_begin;
+                if (SUCCEEDED(vkd3d_helios_internal_teardown_begin(device,
+                        helios_association.device_generation,
+                        helios_association.outer_allocation_token,
+                        &scope, &outer_begin)))
+                    vkd3d_helios_internal_teardown_finish(device,
+                            helios_association.device_generation,
+                            helios_association.outer_allocation_token,
+                            scope, outer_begin);
+            }
+            return E_OUTOFMEMORY;
+        }
+        helios_association.p_next = pNext;
+        allocate_info.pNext = &helios_association;
+        helios_internal_association = true;
+    }
+
     /* In case we get address binding callbacks, ensure driver knows it's not a sparse bind that happens async. */
     vkd3d_address_binding_tracker_mark_user_thread();
 
     vr = VK_CALL(vkAllocateMemory(device->vk_device, &allocate_info, NULL, &allocation->vk_memory));
+
+    if (vr != VK_SUCCESS && helios_internal_association)
+    {
+        void *scope;
+        HRESULT outer_begin;
+        if (SUCCEEDED(vkd3d_helios_internal_teardown_begin(device,
+                helios_association.device_generation,
+                helios_association.outer_allocation_token,
+                &scope, &outer_begin)))
+            vkd3d_helios_internal_teardown_finish(device,
+                    helios_association.device_generation,
+                    helios_association.outer_allocation_token,
+                    scope, outer_begin);
+    }
 
     if (vr == VK_SUCCESS)
     {
@@ -1080,6 +1362,13 @@ static HRESULT vkd3d_try_allocate_device_memory(struct d3d12_device *device,
 
     allocation->vk_memory_type = allocate_info.memoryTypeIndex;
     allocation->size = size;
+    if (helios_internal_association)
+    {
+        allocation->helios_device_generation = helios_association.device_generation;
+        allocation->helios_outer_allocation_token =
+                helios_association.outer_allocation_token;
+        allocation->helios_internal_association = true;
+    }
     return S_OK;
 }
 
@@ -1096,13 +1385,14 @@ static bool vkd3d_memory_info_type_mask_covers_multiple_memory_heaps(
 
 HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
-        void *pNext, bool respect_budget, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool respect_budget, bool helios_external_association,
+        struct vkd3d_device_memory_allocation *allocation)
 {
     const VkMemoryPropertyFlags optional_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     HRESULT hr;
 
     hr = vkd3d_try_allocate_device_memory(device, size, type_flags,
-            type_mask, pNext, respect_budget, allocation);
+            type_mask, pNext, respect_budget, helios_external_association, allocation);
 
     if (FAILED(hr) && (type_flags & optional_flags))
     {
@@ -1115,7 +1405,8 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
             {
                 WARN("Memory allocation failed, falling back to system memory.\n");
                 hr = vkd3d_try_allocate_device_memory(device, size,
-                        type_flags & ~optional_flags, type_mask, pNext, respect_budget, allocation);
+                        type_flags & ~optional_flags, type_mask, pNext, respect_budget,
+                        helios_external_association, allocation);
             }
             else if (!device->memory_info.fallback_domain.rt_ds_type_mask ||
                     !device->memory_info.fallback_domain.sampled_type_mask ||
@@ -1146,7 +1437,8 @@ HRESULT vkd3d_allocate_device_memory(struct d3d12_device *device,
 
 static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_address,
         VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
-        void *pNext, struct vkd3d_device_memory_allocation *allocation)
+        void *pNext, bool helios_external_association,
+        struct vkd3d_device_memory_allocation *allocation)
 {
     VkImportMemoryHostPointerInfoEXT import_info;
     HRESULT hr = S_OK;
@@ -1158,7 +1450,8 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
 
     if (VKD3D_CONFIG_FLAG_IS_SET(USE_HOST_IMPORT_FALLBACK) ||
         FAILED(hr = vkd3d_try_allocate_device_memory(device, size,
-            type_flags, type_mask, &import_info, true, allocation)))
+            type_flags, type_mask, &import_info, true,
+            helios_external_association, allocation)))
     {
         if (FAILED(hr))
             WARN("Failed to import host memory, hr %#x.\n", (int)hr);
@@ -1167,7 +1460,7 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
          * so it's fine. */
         hr = vkd3d_try_allocate_device_memory(device, size,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                type_mask, pNext, true, allocation);
+                type_mask, pNext, true, helios_external_association, allocation);
     }
 
     return hr;
@@ -1466,17 +1759,20 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     if (host_ptr)
     {
         hr = vkd3d_import_host_memory(device, host_ptr, memory_requirements.size,
-                type_flags, type_mask, &flags_info, &allocation->device_allocation);
+                type_flags, type_mask, &flags_info, info->helios_external_association,
+                &allocation->device_allocation);
     }
     else if (info->flags & VKD3D_ALLOCATION_FLAG_NO_FALLBACK)
     {
         hr = vkd3d_try_allocate_device_memory(device, memory_requirements.size, type_flags,
-                type_mask, &flags_info, true, &allocation->device_allocation);
+                type_mask, &flags_info, true, info->helios_external_association,
+                &allocation->device_allocation);
     }
     else
     {
         hr = vkd3d_allocate_device_memory(device, memory_requirements.size, type_flags,
-                type_mask, &flags_info, allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD, &allocation->device_allocation);
+                type_mask, &flags_info, allocation->heap_type == D3D12_HEAP_TYPE_UPLOAD,
+                info->helios_external_association, &allocation->device_allocation);
     }
 
     if (FAILED(hr))
@@ -1942,8 +2238,85 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
 void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
         const struct vkd3d_memory_allocation *allocation)
 {
+    void *helios_scope = NULL;
+    HRESULT hr, finish_hr, retire_hr;
+    VkResult teardown_result;
+
     if (allocation->device_allocation.vk_memory == VK_NULL_HANDLE)
         return;
+
+    if (allocation->helios_outer_allocation_token)
+    {
+        if (!allocation->helios_device_generation || allocation->chunk ||
+                !device->helios_outer_context ||
+                !device->helios_outer_allocation_begin ||
+                !device->helios_outer_allocation_finish ||
+                !device->helios_outer_allocation_retire)
+        {
+            ERR("Associated Helios allocation has incomplete teardown ownership.\n");
+            d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                    "Helios allocation teardown ownership");
+            if (device->helios_outer_allocation_retire)
+                device->helios_outer_allocation_retire(device->helios_outer_context,
+                        allocation->helios_device_generation,
+                        allocation->helios_outer_allocation_token,
+                        VK_ERROR_DEVICE_LOST);
+            return;
+        }
+
+        /* The exact outer context performs the required join. Associated
+         * allocations must never wait on vkd3d's lower transfer queue. */
+        if (allocation->clear_semaphore_value &&
+                !vkd3d_memory_transfer_queue_cancel_helios_clear(
+                        &device->memory_transfers, allocation))
+        {
+            ERR("Associated Helios allocation retained a lower transfer dependency.\n");
+            d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                    "Helios lower transfer dependency");
+            device->helios_outer_allocation_retire(device->helios_outer_context,
+                    allocation->helios_device_generation,
+                    allocation->helios_outer_allocation_token,
+                    VK_ERROR_DEVICE_LOST);
+            return;
+        }
+
+        hr = device->helios_outer_allocation_begin(device->helios_outer_context,
+                allocation->helios_device_generation,
+                allocation->helios_outer_allocation_token, &helios_scope);
+        if ((hr != S_OK && hr != S_FALSE) ||
+                (hr == S_OK && !helios_scope) ||
+                (hr == S_FALSE && helios_scope))
+        {
+            ERR("Helios allocation teardown begin refused, hr %#x, scope %p.\n",
+                    (unsigned int)hr, helios_scope);
+            d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                    "Helios allocation teardown begin");
+            device->helios_outer_allocation_retire(device->helios_outer_context,
+                    allocation->helios_device_generation,
+                    allocation->helios_outer_allocation_token,
+                    VK_ERROR_DEVICE_LOST);
+            return;
+        }
+
+        vkd3d_memory_allocation_free(allocation, device, allocator);
+        teardown_result = VK_SUCCESS;
+        if (hr == S_OK)
+        {
+            finish_hr = device->helios_outer_allocation_finish(
+                    device->helios_outer_context, helios_scope, VK_SUCCESS);
+            if (FAILED(finish_hr))
+                teardown_result = VK_ERROR_DEVICE_LOST;
+        }
+        retire_hr = device->helios_outer_allocation_retire(
+                device->helios_outer_context,
+                allocation->helios_device_generation,
+                allocation->helios_outer_allocation_token,
+                teardown_result);
+        if (teardown_result != VK_SUCCESS || FAILED(retire_hr))
+            d3d12_device_mark_as_removed(device, DXGI_ERROR_DEVICE_REMOVED,
+                    "Helios allocation teardown completion");
+        return;
+    }
 
     if (allocation->clear_semaphore_value)
         vkd3d_memory_transfer_queue_wait_allocation(&device->memory_transfers, allocation);
@@ -2177,6 +2550,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     alloc_info.heap_flags = info->heap_desc.Flags;
     alloc_info.host_ptr = info->host_ptr;
     alloc_info.pNext = info->pNext;
+    alloc_info.helios_external_association = info->helios_external_association;
     alloc_info.vk_memory_priority = info->vk_memory_priority;
     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
 
@@ -2261,7 +2635,8 @@ HRESULT vkd3d_allocate_internal_buffer_memory(struct d3d12_device *device, VkBuf
     /* Internal buffer allocations should not spuriously fail due to budget.
      * We really want them to be allocated even if we have exceeded budget. */
     if (FAILED(hr = vkd3d_allocate_device_memory(device, memory_requirements.size,
-            type_flags, memory_requirements.memoryTypeBits, &flags_info, false, allocation)))
+            type_flags, memory_requirements.memoryTypeBits, &flags_info, false, false,
+            allocation)))
         return hr;
 
     bind_info.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;

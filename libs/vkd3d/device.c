@@ -24,6 +24,7 @@
 #include "vkd3d_timestamp_profiler.h"
 #include "vkd3d_platform.h"
 #include "vkd3d_d3dkmt.h"
+#include "helios_resource_association.h"
 
 #ifdef VKD3D_ENABLE_RENDERDOC
 #include "vkd3d_renderdoc.h"
@@ -105,6 +106,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION_COND(KHR_DYNAMIC_RENDERING_LOCAL_READ, KHR_dynamic_rendering_local_read, VKD3D_CONFIG_FLAG_STATIC(REQUIRE_INPUT_ATTACHMENTS)),
     /* EXT extensions */
     VK_EXTENSION(EXT_CONDITIONAL_RENDERING, EXT_conditional_rendering),
+    VK_EXTENSION(EXT_BUFFER_DEVICE_ADDRESS, EXT_buffer_device_address),
     VK_EXTENSION(EXT_CONSERVATIVE_RASTERIZATION, EXT_conservative_rasterization),
     VK_EXTENSION(EXT_CUSTOM_BORDER_COLOR, EXT_custom_border_color),
     VK_EXTENSION(EXT_DEPTH_CLIP_ENABLE, EXT_depth_clip_enable),
@@ -1430,6 +1432,30 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
 
     vkd3d_config_flags_init();
 
+    if (create_info->vk_instance)
+    {
+        if (!create_info->pfn_vkGetInstanceProcAddr || !create_info->expected_vk_module)
+            return E_INVALIDARG;
+
+        instance->vk_global_procs.vkGetInstanceProcAddr =
+                create_info->pfn_vkGetInstanceProcAddr;
+        if (FAILED(hr = vkd3d_load_vk_instance_procs(&instance->vk_procs,
+                &instance->vk_global_procs, create_info->vk_instance,
+                create_info->expected_vk_module)))
+            return hr;
+
+        instance->vk_instance = create_info->vk_instance;
+        instance->instance_version = VKD3D_MAX_API_VERSION;
+        instance->expected_vk_module = create_info->expected_vk_module;
+        instance->owns_vk_instance = false;
+        instance->singleton_member = false;
+        instance->helios_record_only = create_info->helios_record_only;
+        instance->refcount = 1;
+        TRACE("Imported package-owned Vulkan instance %p.\n",
+                create_info->vk_instance);
+        return S_OK;
+    }
+
     if (FAILED(hr = vkd3d_init_vk_global_procs(instance, create_info->pfn_vkGetInstanceProcAddr)))
     {
         ERR("Failed to initialize Vulkan global procs, hr %#x.\n", (int)hr);
@@ -1543,7 +1569,8 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
         return hresult_from_vk_result(vr);
     }
 
-    if (FAILED(hr = vkd3d_load_vk_instance_procs(&instance->vk_procs, vk_global_procs, vk_instance)))
+    if (FAILED(hr = vkd3d_load_vk_instance_procs(&instance->vk_procs,
+            vk_global_procs, vk_instance, NULL)))
     {
         ERR("Failed to load instance procs, hr %#x.\n", (int)hr);
         vkd3d_free((void *)extensions);
@@ -1553,6 +1580,7 @@ static HRESULT vkd3d_instance_init(struct vkd3d_instance *instance,
     }
 
     instance->vk_instance = vk_instance;
+    instance->owns_vk_instance = true;
     instance->instance_version = loader_version;
 
     instance->vk_info.extension_count = instance_info.enabledExtensionCount;
@@ -1589,7 +1617,25 @@ HRESULT vkd3d_create_instance(const struct vkd3d_instance_create_info *create_in
     struct vkd3d_instance *object;
     HRESULT hr = S_OK;
 
-    /* As long as there are live ID3D12Devices, we should only have one VkInstance that all devices can share. */
+    if (create_info && create_info->vk_instance)
+    {
+        if (!instance)
+            return E_INVALIDARG;
+        vkd3d_init_profiling();
+        if (!(object = vkd3d_malloc(sizeof(*object))))
+            return E_OUTOFMEMORY;
+        if (FAILED(hr = vkd3d_instance_init(object, create_info)))
+        {
+            vkd3d_free(object);
+            return hr;
+        }
+        *instance = object;
+        return S_OK;
+    }
+
+    /* Generic vkd3d retains its one-instance singleton. Package-owned direct
+     * instances are deliberately excluded above so distinct UMD devices never
+     * collapse onto another instance in the process. */
     pthread_mutex_lock(&instance_singleton_lock);
     if (instance_singleton)
     {
@@ -1623,6 +1669,7 @@ HRESULT vkd3d_create_instance(const struct vkd3d_instance_create_info *create_in
     TRACE("Created instance %p.\n", object);
 
     *instance = object;
+    object->singleton_member = true;
     instance_singleton = object;
 
 out_unlock:
@@ -1639,7 +1686,8 @@ static void vkd3d_destroy_instance(struct vkd3d_instance *instance)
         VK_CALL(vkDestroyDebugUtilsMessengerEXT(vk_instance, instance->vk_debug_callback, NULL));
 
     vkd3d_free((void *)instance->vk_info.extension_names);
-    VK_CALL(vkDestroyInstance(vk_instance, NULL));
+    if (instance->owns_vk_instance)
+        VK_CALL(vkDestroyInstance(vk_instance, NULL));
 
     vkd3d_free(instance);
 }
@@ -1656,6 +1704,15 @@ ULONG vkd3d_instance_incref(struct vkd3d_instance *instance)
 ULONG vkd3d_instance_decref(struct vkd3d_instance *instance)
 {
     unsigned int refcount;
+
+    if (!instance->singleton_member)
+    {
+        refcount = InterlockedDecrement(&instance->refcount);
+        TRACE("%p decreasing imported refcount to %u.\n", instance, refcount);
+        if (!refcount)
+            vkd3d_destroy_instance(instance);
+        return refcount;
+    }
 
     /* The device singleton is more advanced, since it uses a CAS loop.
      * Device references are lowered constantly, but instance references only release
@@ -2084,6 +2141,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
 
     info->vulkan_1_2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     vk_prepend_struct(&info->features2, &info->vulkan_1_2_features);
+    if (vulkan_info->EXT_buffer_device_address)
+    {
+        info->buffer_device_address_features_ext.sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT;
+        vk_prepend_struct(&info->features2, &info->buffer_device_address_features_ext);
+    }
     info->vulkan_1_2_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
     vk_prepend_struct(&info->properties2, &info->vulkan_1_2_properties);
 
@@ -3111,6 +3174,12 @@ static HRESULT vkd3d_init_device_extensions(struct d3d12_device *device,
             create_info->optional_device_extension_count,
             user_extension_supported, vulkan_info, "device");
 
+    /* Generic vkd3d uses the promoted Vulkan 1.2 feature.  Only the Helios
+     * record-only construction needs the EXT-only unbound-buffer address arm;
+     * vkCreateDevice must never receive both. */
+    if (!device->vkd3d_instance->helios_record_only)
+        vulkan_info->EXT_buffer_device_address = false;
+
     if (get_spec_version(vk_extensions, count, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) < 3)
         vulkan_info->EXT_vertex_attribute_divisor = false;
 
@@ -3325,7 +3394,11 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
     physical_device_info->vulkan_1_2_features.storagePushConstant8 = VK_FALSE;
     physical_device_info->vulkan_1_2_features.shaderInputAttachmentArrayDynamicIndexing = VK_FALSE;
     physical_device_info->vulkan_1_2_features.shaderInputAttachmentArrayNonUniformIndexing = VK_FALSE;
-    physical_device_info->vulkan_1_2_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
+    /* A record-only Helios device creates capture/replay buffers so Vulkan can
+     * reserve a real device address before its memory bind is materialized in
+     * the first exact outer batch. Generic vkd3d keeps this feature disabled. */
+    if (!device->vkd3d_instance->helios_record_only)
+        physical_device_info->vulkan_1_2_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
     physical_device_info->vulkan_1_2_features.bufferDeviceAddressMultiDevice = VK_FALSE;
     physical_device_info->vulkan_1_2_features.imagelessFramebuffer = VK_FALSE;
     physical_device_info->vulkan_1_2_features.vulkanMemoryModelAvailabilityVisibilityChains = VK_FALSE;
@@ -4135,6 +4208,25 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
         return hr;
     }
 
+    if (device->vkd3d_instance->helios_record_only)
+    {
+        /* VUID-vkGetBufferDeviceAddress-bufferDeviceAddress-03324 allows an
+         * unbound capture/replay buffer only through the EXT feature arm. */
+        if (!device->vk_info.EXT_buffer_device_address ||
+                !device->device_info.buffer_device_address_features_ext.bufferDeviceAddress ||
+                !device->device_info.buffer_device_address_features_ext.bufferDeviceAddressCaptureReplay)
+        {
+            ERR("Helios record-only device lacks EXT buffer-address capture/replay support.\n");
+            vkd3d_free(user_extension_supported);
+            return E_INVALIDARG;
+        }
+
+        device->device_info.vulkan_1_2_features.bufferDeviceAddress = VK_FALSE;
+        device->device_info.vulkan_1_2_features.bufferDeviceAddressCaptureReplay = VK_FALSE;
+        device->device_info.vulkan_1_2_features.bufferDeviceAddressMultiDevice = VK_FALSE;
+        device->device_info.buffer_device_address_features_ext.bufferDeviceAddressMultiDevice = VK_FALSE;
+    }
+
     if (!(extensions = vkd3d_calloc(extension_count, sizeof(*extensions))))
     {
         vkd3d_free(user_extension_supported);
@@ -4204,7 +4296,8 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
         return hresult_from_vk_result(vr);
     }
 
-    if (FAILED(hr = vkd3d_load_vk_device_procs(&device->vk_procs, vk_procs, vk_device)))
+    if (FAILED(hr = vkd3d_load_vk_device_procs(&device->vk_procs, vk_procs,
+            vk_device, device->vkd3d_instance->expected_vk_module)))
     {
         ERR("Failed to load device procs, hr %#x.\n", (int)hr);
         if (device->vk_procs.vkDestroyDevice)
@@ -4863,7 +4956,8 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     vkd3d_meta_ops_cleanup(&device->meta_ops, device);
     vkd3d_bindless_state_cleanup(&device->bindless_state, device);
     d3d12_device_destroy_vkd3d_queues(device);
-    VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
+    if (device->sparse_init_timeline)
+        VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
     vkd3d_null_rtas_allocation_cleanup(&device->null_rtas_allocation, device);
     vkd3d_memory_allocator_cleanup(&device->memory_allocator, device);
     vkd3d_memory_transfer_queue_cleanup(&device->memory_transfers);
@@ -4946,11 +5040,58 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue(d3d12_device_if
     TRACE("iface %p, desc %p, riid %s, command_queue %p.\n",
             iface, desc, debugstr_guid(riid), command_queue);
 
+    if (device->vkd3d_instance->helios_record_only)
+    {
+        ERR("Record-only Helios devices require an immutable outer queue association.\n");
+        if (command_queue)
+            *command_queue = NULL;
+        return E_FAIL;
+    }
+
     if (FAILED(hr = d3d12_command_queue_create(device, desc, VK_QUEUE_FAMILY_IGNORED, &object)))
         return hr;
 
     return return_interface(&object->ID3D12CommandQueue_iface, &IID_ID3D12CommandQueue,
             riid, command_queue);
+}
+
+/* Package-private immutable command-queue construction edge.  Callback
+ * addresses come directly from the embedding UMD's static bridge; they are
+ * neither registered later nor discoverable by process-global lookup. */
+HRESULT helios_vkd3d_create_command_queue_associated(void *iface_ptr,
+        const D3D12_COMMAND_QUEUE_DESC *desc, void *context,
+        uintptr_t begin_address, uintptr_t finish_address, uintptr_t join_address,
+        void **command_queue, uint32_t *vk_family_index, uint32_t *vk_queue_index)
+{
+    d3d12_device_iface *iface = iface_ptr;
+    struct d3d12_command_queue *object;
+    struct d3d12_device *device;
+    HRESULT hr;
+
+    if (!iface || !desc || !context || !begin_address || !finish_address ||
+            !join_address || !command_queue || !vk_family_index || !vk_queue_index)
+        return E_INVALIDARG;
+
+    *command_queue = NULL;
+    *vk_family_index = VK_QUEUE_FAMILY_IGNORED;
+    *vk_queue_index = UINT32_MAX;
+    device = impl_from_ID3D12Device(iface);
+    if (!device->vkd3d_instance->helios_record_only)
+        return E_FAIL;
+    if (FAILED(hr = d3d12_command_queue_create(device, desc,
+            VK_QUEUE_FAMILY_IGNORED, &object)))
+        return hr;
+    if (FAILED(hr = d3d12_command_queue_associate_helios(object, context,
+            begin_address, finish_address, join_address)))
+    {
+        ID3D12CommandQueue_Release(&object->ID3D12CommandQueue_iface);
+        return hr;
+    }
+
+    *vk_family_index = object->vkd3d_queue->vk_family_index;
+    *vk_queue_index = object->vkd3d_queue->vk_queue_index;
+    *command_queue = &object->ID3D12CommandQueue_iface;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandAllocator(d3d12_device_iface *iface,
@@ -8503,6 +8644,51 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateHeap1(d3d12_device_iface *if
     return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
 }
 
+/* Package-private immutable heap-allocation edge. allocation_pnext is owned by
+ * the synchronous caller and reaches only this heap's vkAllocateMemory chain. */
+HRESULT helios_vkd3d_create_heap_associated(void *iface_ptr,
+        const D3D12_HEAP_DESC *desc, const void *allocation_pnext,
+        uint64_t device_generation, uint64_t outer_allocation_token,
+        void **heap)
+{
+    const HeliosResourceAssociationV1 *association = allocation_pnext;
+    d3d12_device_iface *iface = iface_ptr;
+    struct d3d12_device *device;
+    struct d3d12_heap *object;
+    HRESULT hr;
+
+    if (!iface || !desc || !association || !device_generation ||
+            !outer_allocation_token || !heap ||
+            association->s_type != HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE ||
+            association->struct_bytes != HELIOS_RESOURCE_ASSOCIATION_BYTES ||
+            association->p_next ||
+            association->abi_version != HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION ||
+            association->reserved || association->reserved1 ||
+            association->package_generation != HELIOS_PACKAGE_GENERATION ||
+            association->device_generation != device_generation ||
+            association->outer_allocation_token != outer_allocation_token ||
+            association->outer_allocation_bytes != desc->SizeInBytes ||
+            (association->association_flags & ~HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK) ||
+            (!!association->cpu_mapping != !!(association->association_flags &
+                    HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING)) ||
+            (!!association->cpu_mapping !=
+                    (desc->Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE ||
+                     desc->Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)) ||
+            (association->cpu_mapping &&
+                    ((((uintptr_t)association->cpu_mapping) & 4095u) ||
+                     association->outer_allocation_bytes >
+                            UINTPTR_MAX - (uintptr_t)association->cpu_mapping)))
+        return E_INVALIDARG;
+    *heap = NULL;
+    device = impl_from_ID3D12Device(iface);
+    if (FAILED(hr = d3d12_heap_create_with_pnext(device, desc, NULL,
+            allocation_pnext, device_generation, outer_allocation_token,
+            &object)))
+        return hr;
+    return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap,
+            &IID_ID3D12Heap, heap);
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource1(d3d12_device_iface *iface,
         const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value,
         ID3D12ProtectedResourceSession *protected_session, REFIID iid, void **resource)
@@ -11334,7 +11520,8 @@ static void vkd3d_scratch_pool_init(struct d3d12_device *device)
 
 static HRESULT d3d12_device_create_sparse_init_timeline(struct d3d12_device *device)
 {
-    if (!device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING])
+    if (device->vkd3d_instance->helios_record_only ||
+            !device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING])
         return S_OK;
 
     return vkd3d_create_timeline_semaphore(device, 0, false, &device->sparse_init_timeline);
@@ -11343,7 +11530,8 @@ static HRESULT d3d12_device_create_sparse_init_timeline(struct d3d12_device *dev
 static void d3d12_device_reserve_internal_sparse_queue(struct d3d12_device *device)
 {
     /* This cannot fail. We're not allocating memory here. */
-    if (device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING])
+    if (!device->vkd3d_instance->helios_record_only &&
+            device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING])
     {
         device->internal_sparse_queue = d3d12_device_allocate_vkd3d_queue(
                 device->queue_families[VKD3D_QUEUE_FAMILY_SPARSE_BINDING], NULL);
@@ -11375,6 +11563,28 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     device->adapter_luid = create_info->adapter_luid;
     device->removed_reason = S_OK;
+
+    if (instance->helios_record_only)
+    {
+        if (!create_info->helios_outer_context ||
+                !create_info->helios_outer_allocation_create ||
+                !create_info->helios_outer_allocation_teardown_begin ||
+                !create_info->helios_outer_allocation_begin ||
+                !create_info->helios_outer_allocation_finish ||
+                !create_info->helios_outer_allocation_retire)
+        {
+            ERR("Record-only device is missing its immutable outer-allocation teardown edge.\n");
+            hr = E_INVALIDARG;
+            goto out_free_instance;
+        }
+        device->helios_outer_context = create_info->helios_outer_context;
+        device->helios_outer_allocation_create = create_info->helios_outer_allocation_create;
+        device->helios_outer_allocation_teardown_begin =
+                create_info->helios_outer_allocation_teardown_begin;
+        device->helios_outer_allocation_begin = create_info->helios_outer_allocation_begin;
+        device->helios_outer_allocation_finish = create_info->helios_outer_allocation_finish;
+        device->helios_outer_allocation_retire = create_info->helios_outer_allocation_retire;
+    }
     vkd3d_atomic_uint32_store_explicit(
             &device->vendor_hacks.global_ray_tracing_pipeline_create_flags, 0,
             vkd3d_memory_order_relaxed);
@@ -11529,7 +11739,8 @@ out_cleanup_meta_ops:
     vkd3d_meta_ops_cleanup(&device->meta_ops, device);
 out_cleanup_sparse_timeline:
     vk_procs = &device->vk_procs;
-    VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
+    if (device->sparse_init_timeline)
+        VK_CALL(vkDestroySemaphore(device->vk_device, device->sparse_init_timeline, NULL));
 out_cleanup_sampler_state:
     vkd3d_sampler_state_cleanup(&device->sampler_state, device);
 out_cleanup_view_map:

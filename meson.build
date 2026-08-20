@@ -60,6 +60,18 @@ if enable_breadcrumbs
 endif
 
 vkd3d_external_includes = [ './khronos/Vulkan-Headers/include', './khronos/SPIRV-Headers/include' ]
+
+# Consume the one protocol-owned HRA1 C mirror directly.  The nested package
+# must not carry a second declaration which can drift from the UMD and Mesa.
+helios_protocol_include = get_option('helios_protocol_include')
+if helios_protocol_include == ''
+  if vkd3d_platform == 'windows'
+    helios_protocol_include = 'Z:/protocol/include'
+  else
+    helios_protocol_include = '../protocol/include'
+  endif
+endif
+vkd3d_external_includes += [helios_protocol_include]
 vkd3d_public_includes   = [ './include' ] + vkd3d_external_includes
 vkd3d_private_includes  = [ './include/private' ] + vkd3d_public_includes
 

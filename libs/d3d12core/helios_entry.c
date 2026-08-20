@@ -46,10 +46,11 @@
 #ifdef _WIN32
 #include "vkd3d_win32.h"
 #endif
-#include "vkd3d_sonames.h"
 #include "vkd3d.h"
 #include "vkd3d_debug.h"
-#include "vkd3d_threads.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 #include "debug.h"
 
@@ -60,131 +61,124 @@
 #define DLLEXPORT
 #endif
 
-static pthread_once_t helios_vulkan_once = PTHREAD_ONCE_INIT;
-static PFN_vkGetInstanceProcAddr helios_vk_gipa;
-
-#ifdef _WIN32
-static HMODULE helios_vulkan_module;
-#else
-static void *helios_vulkan_module;
-#endif
-
-/* vkd3d_init_vk_global_procs (device.c:461-468) returns E_INVALIDARG when
- * pfn_vkGetInstanceProcAddr is NULL, so the "if set to NULL, libvkd3d loads
- * libvulkan" comment in include/vkd3d.h:68 does not hold for vkd3d-proton: the
- * caller must supply the entry point.  This mirrors load_modules_once
- * (main.c:319-364) without the wineopenxr half, which only feeds VR instance
- * extensions a display driver has no use for. */
-static void helios_load_vulkan_once(void)
+static VkPhysicalDevice helios_find_physical_device(VkInstance instance,
+        PFN_vkGetInstanceProcAddr gipa, LUID adapter_luid)
 {
-#ifdef _WIN32
-    /* Prefer winevulkan directly, as upstream does, to bypass third-party
-     * overlays that hook the Vulkan loader.  On the Helios guest this name is
-     * absent and vulkan-1.dll is the one that resolves. */
-    static const char * const vulkan_dllnames[] =
-    {
-        "winevulkan.dll",
-        "vulkan-1.dll",
-    };
-    unsigned int i;
+    PFN_vkEnumeratePhysicalDevices enumerate_physical_devices;
+    PFN_vkGetPhysicalDeviceProperties2 get_properties2;
+    VkPhysicalDevice *physical_devices = NULL;
+    VkPhysicalDevice match = VK_NULL_HANDLE;
+    uint32_t count = 0;
+    VkResult vr;
 
-    for (i = 0; i < ARRAY_SIZE(vulkan_dllnames); i++)
+    enumerate_physical_devices = (PFN_vkEnumeratePhysicalDevices)
+            gipa(instance, "vkEnumeratePhysicalDevices");
+    get_properties2 = (PFN_vkGetPhysicalDeviceProperties2)
+            gipa(instance, "vkGetPhysicalDeviceProperties2");
+    if (!enumerate_physical_devices || !get_properties2)
+        return VK_NULL_HANDLE;
+    if ((vr = enumerate_physical_devices(instance, &count, NULL)) != VK_SUCCESS ||
+            !count || count > 64)
+        return VK_NULL_HANDLE;
+    if (!(physical_devices = calloc(count, sizeof(*physical_devices))))
+        return VK_NULL_HANDLE;
+    if ((vr = enumerate_physical_devices(instance, &count, physical_devices)) != VK_SUCCESS)
+        goto done;
+
+    for (uint32_t i = 0; i < count; ++i)
     {
-        helios_vulkan_module = LoadLibraryA(vulkan_dllnames[i]);
-        if (!helios_vulkan_module)
+        VkPhysicalDeviceIDProperties id_properties;
+        VkPhysicalDeviceProperties2 properties;
+
+        memset(&id_properties, 0, sizeof(id_properties));
+        id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        memset(&properties, 0, sizeof(properties));
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties.pNext = &id_properties;
+        get_properties2(physical_devices[i], &properties);
+        if (!id_properties.deviceLUIDValid ||
+                memcmp(id_properties.deviceLUID, &adapter_luid, VK_LUID_SIZE))
             continue;
-
-        helios_vk_gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(
-                helios_vulkan_module, "vkGetInstanceProcAddr");
-        if (helios_vk_gipa)
-            break;
-
-        FreeLibrary(helios_vulkan_module);
-        helios_vulkan_module = NULL;
+        if (match)
+        {
+            ERR("More than one A5 physical device matched LUID %08x:%08x.\n",
+                    (unsigned int)adapter_luid.HighPart,
+                    (unsigned int)adapter_luid.LowPart);
+            match = VK_NULL_HANDLE;
+            goto done;
+        }
+        match = physical_devices[i];
     }
-#else
-    helios_vulkan_module = dlopen(SONAME_LIBVULKAN, RTLD_LAZY);
-    if (helios_vulkan_module)
-        helios_vk_gipa = (PFN_vkGetInstanceProcAddr)dlsym(helios_vulkan_module, "vkGetInstanceProcAddr");
-#endif
+
+done:
+    free(physical_devices);
+    return match;
 }
 
-DLLEXPORT HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device)
+DLLEXPORT HRESULT helios_vkd3d_create_device(VkInstance vk_instance,
+        PFN_vkGetInstanceProcAddr gipa, void *expected_vk_module,
+        LUID adapter_luid, void *outer_context,
+        HRESULT (*outer_allocation_create)(void *, uint64_t, uint32_t, uint32_t,
+                struct HeliosResourceAssociationV1 *),
+        HRESULT (*outer_allocation_teardown_begin)(void *, uint64_t, uint64_t),
+        HRESULT (*outer_allocation_begin)(void *, uint64_t, uint64_t, void **),
+        HRESULT (*outer_allocation_finish)(void *, void *, VkResult),
+        HRESULT (*outer_allocation_retire)(void *, uint64_t, uint64_t, VkResult),
+        REFIID iid, void **device)
 {
-    /* The same lists d3d12core uses (main.c:574-593, :659-670), so that the
-     * device this export creates is configured exactly like the one vkd3d's own
-     * conformance suite creates — that equivalence is what makes the D12-G1
-     * engine gate predictive of the shipping path. */
-    static const char * const instance_extensions[] =
-    {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-#ifdef _WIN32
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-#endif
-    };
-
-    static const char * const optional_instance_extensions[] =
-    {
-        VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
-        VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
-        VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
-    };
-
-    static const char * const device_extensions[] =
-    {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-    };
-
-    static const char * const optional_device_extensions[] =
-    {
-        VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
-        VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
-    };
-
     struct vkd3d_instance_create_info instance_create_info;
     struct vkd3d_device_create_info device_create_info;
+    struct vkd3d_instance *instance = NULL;
+    VkPhysicalDevice physical_device;
+    HRESULT hr;
 
     TRACE("adapter_luid %08x:%08x, iid %s, device %p.\n",
             (unsigned int)adapter_luid.HighPart, (unsigned int)adapter_luid.LowPart,
             debugstr_guid(iid), device);
 
-    if (!device)
+    if (!device || !vk_instance || !gipa || !expected_vk_module || !outer_context ||
+            !outer_allocation_create || !outer_allocation_teardown_begin ||
+            !outer_allocation_begin || !outer_allocation_finish ||
+            !outer_allocation_retire ||
+            (!adapter_luid.LowPart && !adapter_luid.HighPart))
         return E_INVALIDARG;
 
-    pthread_once(&helios_vulkan_once, helios_load_vulkan_once);
-    if (!helios_vk_gipa)
+    memset(&instance_create_info, 0, sizeof(instance_create_info));
+    instance_create_info.pfn_vkGetInstanceProcAddr = gipa;
+    instance_create_info.vk_instance = vk_instance;
+    instance_create_info.expected_vk_module = expected_vk_module;
+    instance_create_info.helios_record_only = true;
+    if (FAILED(hr = vkd3d_create_instance(&instance_create_info, &instance)))
+        return hr;
+
+    physical_device = helios_find_physical_device(vk_instance, gipa, adapter_luid);
+    if (!physical_device)
     {
-        ERR("Failed to load Vulkan library.\n");
+        ERR("A5 instance has no unique physical device for LUID %08x:%08x.\n",
+                (unsigned int)adapter_luid.HighPart,
+                (unsigned int)adapter_luid.LowPart);
+        vkd3d_instance_decref(instance);
         return E_FAIL;
     }
 
-    memset(&instance_create_info, 0, sizeof(instance_create_info));
-    instance_create_info.pfn_vkGetInstanceProcAddr = helios_vk_gipa;
-    instance_create_info.instance_extensions = instance_extensions;
-    instance_create_info.instance_extension_count = ARRAY_SIZE(instance_extensions);
-    instance_create_info.optional_instance_extensions = optional_instance_extensions;
-    instance_create_info.optional_instance_extension_count = ARRAY_SIZE(optional_instance_extensions);
-
     memset(&device_create_info, 0, sizeof(device_create_info));
     device_create_info.minimum_feature_level = D3D_FEATURE_LEVEL_11_0;
-    device_create_info.instance = NULL;
-    device_create_info.instance_create_info = &instance_create_info;
-    /* VK_NULL_HANDLE delegates selection to vkd3d_select_physical_device
-     * (device.c:3491-3573), which honours VKD3D_FILTER_DEVICE_NAME and otherwise
-     * prefers DISCRETE > INTEGRATED > physical_devices[0].  That is correct on a
-     * single-GPU guest but it is NOT LUID matching: if a second Vulkan device
-     * ever appears in the guest, chain VkPhysicalDeviceIDProperties here and
-     * match deviceLUID against adapter_luid first, the way
-     * d3d12_find_physical_device (main.c:446-566) does at :498-532. */
-    device_create_info.vk_physical_device = VK_NULL_HANDLE;
-    device_create_info.device_extensions = device_extensions;
-    device_create_info.device_extension_count = ARRAY_SIZE(device_extensions);
-    device_create_info.optional_device_extensions = optional_device_extensions;
-    device_create_info.optional_device_extension_count = ARRAY_SIZE(optional_device_extensions);
+    device_create_info.instance = instance;
+    device_create_info.vk_physical_device = physical_device;
     device_create_info.parent = NULL;   /* deliberately NOT an IDXGIAdapter */
     device_create_info.adapter_luid = adapter_luid;
+    device_create_info.independent = true;
+    device_create_info.helios_outer_context = outer_context;
+    device_create_info.helios_outer_allocation_create = outer_allocation_create;
+    device_create_info.helios_outer_allocation_teardown_begin =
+            outer_allocation_teardown_begin;
+    device_create_info.helios_outer_allocation_begin = outer_allocation_begin;
+    device_create_info.helios_outer_allocation_finish = outer_allocation_finish;
+    device_create_info.helios_outer_allocation_retire = outer_allocation_retire;
 
-    return vkd3d_create_device(&device_create_info, iid, device);
+    hr = vkd3d_create_device(&device_create_info, iid, device);
+    vkd3d_instance_decref(instance);
+    return hr;
 }
 
 DLLEXPORT HRESULT helios_vkd3d_serialize_root_signature(

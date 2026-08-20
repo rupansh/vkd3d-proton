@@ -58,11 +58,25 @@ extern "C" {
 #endif  /* __cplusplus */
 
 struct vkd3d_instance;
+struct HeliosResourceAssociationV1;
 
 struct vkd3d_instance_create_info
 {
     /* If set to NULL, libvkd3d loads libvulkan. */
     PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr;
+
+    /* Optional exact instance owned by the embedding package. When non-null,
+     * libvkd3d wraps it without creating or destroying another VkInstance. */
+    VkInstance vk_instance;
+
+    /* Required with vk_instance on Windows. Every resolved Vulkan procedure
+     * must belong to this module or instance/device creation fails closed. */
+    void *expected_vk_module;
+
+    /* The package-owned Helios instance is a record-only translator.  It has
+     * no autonomous lower execution queue; command queues must be created
+     * through the immutable Helios association edge. */
+    bool helios_record_only;
 
     const char * const *instance_extensions;
     uint32_t instance_extension_count;
@@ -91,6 +105,25 @@ struct vkd3d_device_create_info
 
     D3D12_DEVICE_FACTORY_FLAGS device_factory_flags;
     bool independent;
+
+    /* Immutable package-owned teardown edge for record-only Helios
+     * allocations. The context is lifetime only; allocation identity is the
+     * explicit device-generation/token pair. S_FALSE from begin means the
+     * allocation was never materialised in an outer batch. */
+    void *helios_outer_context;
+    HRESULT (*helios_outer_allocation_create)(void *context,
+            uint64_t bytes, uint32_t cpu_visible, uint32_t device_local,
+            struct HeliosResourceAssociationV1 *association_out);
+    HRESULT (*helios_outer_allocation_teardown_begin)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token);
+    HRESULT (*helios_outer_allocation_begin)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token,
+            void **scope);
+    HRESULT (*helios_outer_allocation_finish)(void *context,
+            void *scope, VkResult lower_result);
+    HRESULT (*helios_outer_allocation_retire)(void *context,
+            uint64_t device_generation, uint64_t outer_allocation_token,
+            VkResult teardown_result);
 };
 
 struct vkd3d_image_resource_create_info

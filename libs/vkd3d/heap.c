@@ -300,7 +300,9 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
 }
 
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
-        const D3D12_HEAP_DESC *desc, void* host_address)
+        const D3D12_HEAP_DESC *desc, void* host_address,
+        const void *allocation_pnext, uint64_t helios_device_generation,
+        uint64_t helios_outer_allocation_token)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
     VkExportMemoryAllocateInfo export_info;
@@ -330,6 +332,8 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(&alloc_info, 0, sizeof(alloc_info));
     alloc_info.heap_desc = heap->desc;
     alloc_info.host_ptr = host_address;
+    alloc_info.pNext = allocation_pnext;
+    alloc_info.helios_external_association = helios_outer_allocation_token != 0;
 
     if ((alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
         d3d12_device_allow_image_heap_suballocation(device))
@@ -349,6 +353,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
          * the same D3D12 heap. */
         memset(&export_info, 0, sizeof(export_info));
         export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        export_info.pNext = allocation_pnext;
         export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
         alloc_info.pNext = &export_info;
         alloc_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_DEDICATED;
@@ -400,6 +405,9 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         return hr;
     }
 
+    heap->allocation.helios_device_generation = helios_device_generation;
+    heap->allocation.helios_outer_allocation_token = helios_outer_allocation_token;
+
     heap->priority.allows_dynamic_residency = 
         device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
         heap->allocation.chunk == NULL /* not suballocated */ &&
@@ -421,13 +429,29 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
         void* host_address, struct d3d12_heap **heap)
 {
+    return d3d12_heap_create_with_pnext(device, desc, host_address, NULL, 0, 0, heap);
+}
+
+HRESULT d3d12_heap_create_with_pnext(struct d3d12_device *device,
+        const D3D12_HEAP_DESC *desc, void *host_address,
+        const void *allocation_pnext, uint64_t helios_device_generation,
+        uint64_t helios_outer_allocation_token, struct d3d12_heap **heap)
+{
     struct d3d12_heap *object;
     HRESULT hr;
 
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address)))
+    if ((helios_device_generation == 0) != (helios_outer_allocation_token == 0))
+    {
+        vkd3d_free(object);
+        return E_INVALIDARG;
+    }
+
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address,
+            allocation_pnext, helios_device_generation,
+            helios_outer_allocation_token)))
     {
         vkd3d_free(object);
         return hr;

@@ -1532,17 +1532,41 @@ HRESULT vkd3d_load_vk_global_procs(struct vkd3d_vk_global_procs *procs,
     return S_OK;
 }
 
+#ifdef _WIN32
+static bool vkd3d_vk_proc_has_module(void *proc, void *expected_module)
+{
+    HMODULE module = NULL;
+
+    if (!proc)
+        return false;
+    if (!expected_module)
+        return true;
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (const char *)proc, &module) && module == expected_module;
+}
+#else
+static bool vkd3d_vk_proc_has_module(void *proc, void *expected_module)
+{
+    return proc && !expected_module;
+}
+#endif
+
 #define LOAD_INSTANCE_PFN(name) \
-    if (!(procs->name = (void *)global_procs->vkGetInstanceProcAddr(instance, #name))) \
+    if (!(procs->name = (void *)global_procs->vkGetInstanceProcAddr(instance, #name)) || \
+            !vkd3d_vk_proc_has_module((void *)procs->name, expected_vk_module)) \
     { \
-        ERR("Could not get instance proc addr for '" #name "'.\n"); \
+        ERR("Could not get package-owned instance proc addr for '" #name "'.\n"); \
         return E_FAIL; \
     }
 #define LOAD_INSTANCE_OPTIONAL_PFN(name) \
-    procs->name = (void *)global_procs->vkGetInstanceProcAddr(instance, #name);
+    procs->name = (void *)global_procs->vkGetInstanceProcAddr(instance, #name); \
+    if (procs->name && !vkd3d_vk_proc_has_module((void *)procs->name, expected_vk_module)) \
+        procs->name = NULL;
 
 HRESULT vkd3d_load_vk_instance_procs(struct vkd3d_vk_instance_procs *procs,
-        const struct vkd3d_vk_global_procs *global_procs, VkInstance instance)
+        const struct vkd3d_vk_global_procs *global_procs, VkInstance instance,
+        void *expected_vk_module)
 {
     memset(procs, 0, sizeof(*procs));
 
@@ -1556,16 +1580,20 @@ HRESULT vkd3d_load_vk_instance_procs(struct vkd3d_vk_instance_procs *procs,
 
 #define COPY_PARENT_PFN(name) procs->name = parent_procs->name;
 #define LOAD_DEVICE_PFN(name) \
-    if (!(procs->name = (void *)procs->vkGetDeviceProcAddr(device, #name))) \
+    if (!(procs->name = (void *)procs->vkGetDeviceProcAddr(device, #name)) || \
+            !vkd3d_vk_proc_has_module((void *)procs->name, expected_vk_module)) \
     { \
-        ERR("Could not get device proc addr for '" #name "'.\n"); \
+        ERR("Could not get package-owned device proc addr for '" #name "'.\n"); \
         return E_FAIL; \
     }
 #define LOAD_DEVICE_OPTIONAL_PFN(name) \
-    procs->name = (void *)procs->vkGetDeviceProcAddr(device, #name);
+    procs->name = (void *)procs->vkGetDeviceProcAddr(device, #name); \
+    if (procs->name && !vkd3d_vk_proc_has_module((void *)procs->name, expected_vk_module)) \
+        procs->name = NULL;
 
 HRESULT vkd3d_load_vk_device_procs(struct vkd3d_vk_device_procs *procs,
-        const struct vkd3d_vk_instance_procs *parent_procs, VkDevice device)
+        const struct vkd3d_vk_instance_procs *parent_procs, VkDevice device,
+        void *expected_vk_module)
 {
     memset(procs, 0, sizeof(*procs));
 
@@ -1963,4 +1991,3 @@ void d3d_destruction_notifier_notify(struct d3d_destruction_notifier *notifier)
     notifier->callback_count = 0u;
     notifier->callback_size = 0u;
 }
-

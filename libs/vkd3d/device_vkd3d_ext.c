@@ -1030,6 +1030,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_dxvk_interop_device_CreateInteropCommandQ
     TRACE("iface %p, desc %p, vk_family_index %"PRIu32", command_queue %p.\n",
             iface, desc, vk_family_index, command_queue);
 
+    if (device->vkd3d_instance->helios_record_only)
+    {
+        if (command_queue)
+            *command_queue = NULL;
+        return E_FAIL;
+    }
+
     hr = d3d12_command_queue_create(device, desc, vk_family_index, &object);
     if (FAILED(hr))
         return hr;
