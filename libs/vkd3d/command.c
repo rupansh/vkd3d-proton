@@ -29,6 +29,10 @@
 #endif
 
 static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_worker *worker, uint64_t value);
+static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
+        struct d3d12_command_queue_submission *sub, HANDLE admission_event,
+        uint32_t *ctx, uint32_t *value, uint64_t *cookie);
+
 static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
         const struct d3d12_command_queue_submission *sub);
 static void d3d12_fence_inc_ref(struct d3d12_fence *fence);
@@ -22337,6 +22341,7 @@ ULONG STDMETHODCALLTYPE d3d12_command_queue_Release(ID3D12CommandQueue *iface)
         pthread_cond_destroy(&command_queue->queue_cond);
 
         vkd3d_fence_worker_stop(&command_queue->fence_worker, device);
+        vkd3d_helios_queue_cleanup(command_queue);
 
         vkd3d_free(command_queue->submissions);
         vkd3d_free(command_queue->wait_semaphores);
@@ -22507,7 +22512,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_UpdateTileMappings(ID3D12Comma
 
     if (!(bound_tiles = vkd3d_calloc(sparse->tile_count, sizeof(*bound_tiles))))
     {
-        ERR("Failed to allocate tile mapping table.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate tile mapping table.");
         return;
     }
 
@@ -22557,7 +22562,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_UpdateTileMappings(ID3D12Comma
                     if (!vkd3d_array_reserve((void **)&sub.bind_sparse.bind_infos, &bind_infos_size,
                             sub.bind_sparse.bind_count + 1, sizeof(*sub.bind_sparse.bind_infos)))
                     {
-                        ERR("Failed to allocate bind info array.\n");
+                        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate bind info array.");
                         goto fail;
                     }
 
@@ -22655,7 +22660,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_CopyTileMappings(ID3D12Command
 
     if (!sub.bind_sparse.bind_infos)
     {
-        ERR("Failed to allocate bind info array.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate bind info array.");
         return;
     }
 
@@ -22761,8 +22766,9 @@ out:
     return ret;
 }
 
-static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQueue *iface,
-        UINT command_list_count, ID3D12CommandList * const *command_lists)
+static bool d3d12_command_queue_prepare_execute(ID3D12CommandQueue *iface,
+        UINT command_list_count, ID3D12CommandList * const *command_lists,
+        HANDLE admission_event, uint32_t *ctx, uint32_t *value, uint64_t *cookie)
 {
     struct d3d12_command_queue *command_queue = impl_from_ID3D12CommandQueue(iface);
     struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
@@ -22788,13 +22794,13 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
             iface, command_list_count, command_lists);
 
     if (!command_list_count)
-        return;
+        return false;
 
     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
     {
         d3d12_device_mark_as_removed(command_queue->device, hr,
                 "Failed to execute pending memory clears.\n");
-        return;
+        return false;
     }
 
     memset(&sub, 0, sizeof(sub));
@@ -22825,7 +22831,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
         if (!cmd_list)
         {
             WARN("Unsupported command list type %p.\n", cmd_list);
-            return;
+            return false;
         }
 
 #ifdef VKD3D_ENABLE_PROFILING
@@ -22860,21 +22866,21 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
 
     if (!(buffers = vkd3d_calloc(num_command_buffers, sizeof(*buffers))))
     {
-        ERR("Failed to allocate command buffer array.\n");
-        return;
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate command buffer array.");
+        return false;
     }
 
     if (!(allocators = vkd3d_calloc(command_list_count, sizeof(*allocators))))
     {
-        ERR("Failed to allocate outstanding submissions count.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate outstanding submissions count.");
         vkd3d_free(buffers);
-        return;
+        return false;
     }
 
     if (!(cmd_cost = vkd3d_calloc(num_command_buffers, sizeof(*cmd_cost))))
     {
-        ERR("Failed to allocate command buffer cost array.\n");
-        return;
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate command buffer cost array.");
+        return false;
     }
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -22959,7 +22965,7 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
 #endif
             vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
                     NULL, timeline_cookie);
-            return;
+            return false;
         }
 
         num_transitions += cmd_list->init_transitions_count;
@@ -23166,8 +23172,44 @@ static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12Comm
     sub.execute.breadcrumb_indices_count = breadcrumb_indices ? command_list_count : 0;
 #endif
     sub.execute.timeline_cookie = timeline_cookie;
-    d3d12_command_queue_add_submission(command_queue, &sub);
+    if (admission_event && !vkd3d_helios_commit_execute(command_queue, &sub,
+            admission_event, ctx, value, cookie))
+    {
+        for (i = 0; i < command_list_count; i++)
+            d3d12_command_allocator_dec_ref(allocators[i]);
+        vkd3d_free(allocators);
+        vkd3d_free(buffers);
+        vkd3d_free(cmd_cost);
+        vkd3d_free(sub.execute.transitions);
+#ifdef VKD3D_ENABLE_BREADCRUMBS
+        vkd3d_free(breadcrumb_indices);
+#endif
+        vkd3d_queue_timeline_trace_complete_execute(&command_queue->device->queue_timeline_trace,
+                NULL, timeline_cookie);
+        return false;
+    }
+    if (!admission_event)
+        d3d12_command_queue_add_submission(command_queue, &sub);
+    return true;
 }
+
+static void STDMETHODCALLTYPE d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQueue *iface,
+        UINT count, ID3D12CommandList * const *lists)
+{
+    d3d12_command_queue_prepare_execute(iface, count, lists, NULL, NULL, NULL, NULL);
+}
+
+HRESULT helios_vkd3d_execute_command_lists(ID3D12CommandQueue *iface,
+        UINT count, ID3D12CommandList * const *lists, HANDLE admission_event,
+        uint32_t *ctx, uint32_t *value, uint64_t *cookie)
+{
+    if (!iface || !count || !lists || !admission_event || !ctx || !value || !cookie)
+        return E_INVALIDARG;
+    *ctx = *value = 0; *cookie = 0;
+    return d3d12_command_queue_prepare_execute(iface, count, lists,
+            admission_event, ctx, value, cookie) ? S_OK : E_FAIL;
+}
+
 
 static void STDMETHODCALLTYPE d3d12_command_queue_SetMarker(ID3D12CommandQueue *iface,
         UINT metadata, const void *data, UINT size)
@@ -23506,7 +23548,7 @@ static void d3d12_command_queue_add_wait_semaphores(struct d3d12_command_queue *
     if (!vkd3d_array_reserve((void**)&command_queue->wait_semaphores, &command_queue->wait_semaphores_size,
             command_queue->wait_semaphore_count + wait_count, sizeof(*command_queue->wait_semaphores)))
     {
-        ERR("Failed to allocate semaphore wait list.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate semaphore wait list.");
         return;
     }
 
@@ -23540,7 +23582,7 @@ static void d3d12_command_queue_add_wait(struct d3d12_command_queue *command_que
     if (!vkd3d_array_reserve((void**)&command_queue->wait_fences, &command_queue->wait_fences_size,
             command_queue->wait_fence_count + 1, sizeof(*command_queue->wait_fences)))
     {
-        ERR("Failed to add fence wait to queue.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to add fence wait to queue.");
         return;
     }
 
@@ -23646,7 +23688,8 @@ static void d3d12_command_queue_flush_waiters(struct d3d12_command_queue *comman
 
     if (!(vk_queue = vkd3d_queue_acquire(command_queue->vkd3d_queue)))
     {
-        ERR("Failed to acquire queue %p.\n", command_queue->vkd3d_queue);
+        d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", command_queue->vkd3d_queue);
         return;
     }
 
@@ -23669,7 +23712,8 @@ static void d3d12_command_queue_flush_waiters(struct d3d12_command_queue *comman
 
         if ((vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_info,
             vkd3d_queue_get_signal_fence_proxy_locked(command_queue->vkd3d_queue)))))
-            ERR("Failed to submit semaphore waits, vr %d.\n", vr);
+            d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                "Failed to submit semaphore waits, vr %d.", vr);
 
         if (vr == VK_SUCCESS && (wait_flags & VKD3D_WAIT_SEMAPHORES_SERIALIZING))
             command_queue->serializing_semaphore_signaled = false;
@@ -23770,7 +23814,8 @@ static void d3d12_command_queue_wait(struct d3d12_command_queue *command_queue,
 
         cookie = vkd3d_queue_timeline_trace_register_generic_region(&fence->device->queue_timeline_trace, "CPU WAIT");
         if ((vr = VK_CALL(vkWaitSemaphores(command_queue->device->vk_device, &wait_info, UINT64_MAX))))
-            ERR("Failed to wait for timeline semaphore, vr %d.\n", vr);
+            d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                "Failed to wait for timeline semaphore, vr %d.", vr);
         vkd3d_queue_timeline_trace_complete_execute(&fence->device->queue_timeline_trace, &command_queue->fence_worker, cookie);
     }
     else
@@ -23846,6 +23891,9 @@ static void d3d12_command_queue_wait_shared(struct d3d12_command_queue *command_
     wait_info.semaphoreCount = 1;
     wait_info.pValues = &value;
     vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, UINT64_MAX));
+    if (vr != VK_SUCCESS)
+        d3d12_device_mark_as_removed(device, hresult_from_vk_result(vr),
+                "Preceding queue wait failed, vr %d.", vr);
     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
 }
 
@@ -23871,7 +23919,8 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
 
     if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
     {
-        ERR("Failed to acquire queue %p.\n", vkd3d_queue);
+        d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", vkd3d_queue);
         return;
     }
 
@@ -23905,7 +23954,8 @@ static void d3d12_command_queue_signal_shared(struct d3d12_command_queue *comman
 
     if (vr < 0)
     {
-        ERR("Failed to submit signal operation, vr %d.\n", vr);
+        d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                "Failed to submit signal operation, vr %d.", vr);
         return;
     }
 
@@ -24043,6 +24093,9 @@ static void d3d12_command_queue_transition_pool_wait(struct d3d12_command_queue_
     wait_info.semaphoreCount = 1;
     wait_info.pValues = &value;
     vr = VK_CALL(vkWaitSemaphores(device->vk_device, &wait_info, ~(uint64_t)0));
+    if (vr != VK_SUCCESS)
+        d3d12_device_mark_as_removed(device, hresult_from_vk_result(vr),
+                "Preceding queue wait failed, vr %d.", vr);
     VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(device, vr == VK_ERROR_DEVICE_LOST);
 }
 
@@ -24064,7 +24117,7 @@ static void d3d12_command_queue_transition_pool_add_barrier(struct d3d12_command
     if (!vkd3d_array_reserve((void**)&pool->barriers, &pool->barriers_size,
             pool->barriers_count + 1, sizeof(*pool->barriers)))
     {
-        ERR("Failed to allocate barriers.\n");
+        d3d12_device_mark_as_removed(resource->device, E_OUTOFMEMORY, "Failed to allocate barriers.");
         return;
     }
 
@@ -24078,7 +24131,7 @@ static void d3d12_command_queue_transition_pool_add_query_heap(struct d3d12_comm
     if (!vkd3d_array_reserve((void**)&pool->query_heaps, &pool->query_heaps_size,
             pool->query_heaps_count + 1, sizeof(*pool->query_heaps)))
     {
-        ERR("Failed to allocate query heap list.\n");
+        d3d12_device_mark_as_removed(heap->device, E_OUTOFMEMORY, "Failed to allocate query heap list.");
         return;
     }
 
@@ -24130,6 +24183,7 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     uint32_t need_transition;
     VkCommandBuffer cmd;
     bool qa_checks;
+    VkResult vr;
     size_t i;
 
     pool->barriers_count = 0;
@@ -24188,8 +24242,9 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
     begin_info.pNext = NULL;
     begin_info.pInheritanceInfo = NULL;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CALL(vkResetCommandBuffer(cmd, 0));
-    VK_CALL(vkBeginCommandBuffer(cmd, &begin_info));
+    if ((vr = VK_CALL(vkResetCommandBuffer(cmd, 0))) != VK_SUCCESS ||
+            (vr = VK_CALL(vkBeginCommandBuffer(cmd, &begin_info))) != VK_SUCCESS)
+        goto failed;
 
     memset(&dep_info, 0, sizeof(dep_info));
     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -24218,10 +24273,16 @@ static void d3d12_command_queue_transition_pool_build(struct d3d12_command_queue
 
     for (i = 0; i < pool->query_heaps_count; i++)
         d3d12_command_queue_init_query_heap(device, cmd, pool->query_heaps[i]);
-    VK_CALL(vkEndCommandBuffer(cmd));
+    if ((vr = VK_CALL(vkEndCommandBuffer(cmd))) != VK_SUCCESS)
+        goto failed;
 
     *vk_cmd_buffer = cmd;
     *timeline_value = pool->timeline_value;
+    return;
+failed:
+    *vk_cmd_buffer = VK_NULL_HANDLE;
+    d3d12_device_mark_as_removed(device, hresult_from_vk_result(vr),
+            "Initial transition recording failed, vr %d.", vr);
 }
 
 static VkResult d3d12_command_queue_submit_split_locked(struct d3d12_device *device,
@@ -24293,7 +24354,8 @@ static void d3d12_command_queue_wait_staggered_submission(struct d3d12_command_q
     wait_info.pValues = &command_queue->last_submission_timeline_value;
 
     if ((vr = VK_CALL(vkWaitSemaphores(command_queue->device->vk_device, &wait_info, UINT64_MAX))))
-        ERR("Failed to wait for semaphore, vr %d.\n", vr);
+        d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                "Failed to wait for semaphore, vr %d.", vr);
 }
 
 static bool d3d12_command_queue_needs_staggered_submissions(struct d3d12_command_queue *command_queue)
@@ -24399,7 +24461,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
 
     if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
     {
-        ERR("Failed to acquire queue %p.\n", vkd3d_queue);
+        d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", vkd3d_queue);
         for (i = 0; i < exec->num_command_allocators; i++)
             d3d12_command_allocator_dec_ref(exec->command_allocators[i]);
         vkd3d_free(exec->command_allocators);
@@ -24637,7 +24700,11 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
         VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(command_queue->device, vr == VK_ERROR_DEVICE_LOST);
 
         if (vr != VK_SUCCESS)
+        {
+            d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                    "Preceding queue execution failed, vr %d.", vr);
             break;
+        }
 
         /* If serializing binary semaphore is not used, the serializing command buffer is always executed on the expected
          * queue at the end. If it is used, the last fallback queue submission signals the binary semaphore,
@@ -24659,7 +24726,8 @@ static void d3d12_command_queue_execute(struct d3d12_command_queue *command_queu
 
             if (!(vk_queue = vkd3d_queue_acquire(vkd3d_queue)))
             {
-                ERR("Failed to acquire queue %p.\n", vkd3d_queue);
+                d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", vkd3d_queue);
                 return;
             }
         }
@@ -24835,7 +24903,7 @@ static void d3d12_command_queue_bind_sparse(struct d3d12_command_queue *command_
 
     if (!(bind_ranges = vkd3d_malloc(count * sizeof(*bind_ranges))))
     {
-        ERR("Failed to allocate bind range info.\n");
+        d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate bind range info.");
         goto cleanup;
     }
 
@@ -24849,7 +24917,7 @@ static void d3d12_command_queue_bind_sparse(struct d3d12_command_queue *command_
     {
         if (!(memory_binds = vkd3d_malloc(count * sizeof(*memory_binds))))
         {
-            ERR("Failed to allocate sparse memory bind info.\n");
+            d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate sparse memory bind info.");
             goto cleanup;
         }
 
@@ -24883,7 +24951,7 @@ static void d3d12_command_queue_bind_sparse(struct d3d12_command_queue *command_
         {
             if (!(memory_binds = vkd3d_malloc(opaque_bind_count * sizeof(*memory_binds))))
             {
-                ERR("Failed to allocate sparse memory bind info.\n");
+                d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate sparse memory bind info.");
                 goto cleanup;
             }
 
@@ -24902,7 +24970,7 @@ static void d3d12_command_queue_bind_sparse(struct d3d12_command_queue *command_
         {
             if (!(image_binds = vkd3d_malloc(image_bind_count * sizeof(*image_binds))))
             {
-                ERR("Failed to allocate sparse memory bind info.\n");
+                d3d12_device_mark_as_removed(command_queue->device, E_OUTOFMEMORY, "Failed to allocate sparse memory bind info.");
                 goto cleanup;
             }
 
@@ -25052,7 +25120,8 @@ static void d3d12_command_queue_flush_bind_sparse(struct d3d12_command_queue *co
 
     if (!(vk_queue = vkd3d_queue_acquire(queue)))
     {
-        ERR("Failed to acquire queue %p.\n", queue);
+        d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", queue);
         goto cleanup;
     }
 
@@ -25060,7 +25129,8 @@ static void d3d12_command_queue_flush_bind_sparse(struct d3d12_command_queue *co
     {
         if (!(vk_queue_sparse = vkd3d_queue_acquire(queue_sparse)))
         {
-            ERR("Failed to acquire queue %p.\n", queue_sparse);
+            d3d12_device_mark_as_removed(command_queue->device, DXGI_ERROR_DEVICE_REMOVED,
+                "Failed to acquire queue %p.", queue_sparse);
             vkd3d_queue_release(queue);
             goto cleanup;
         }
@@ -25098,7 +25168,8 @@ static void d3d12_command_queue_flush_bind_sparse(struct d3d12_command_queue *co
 
     if ((vr = VK_CALL(vkQueueBindSparse(vk_queue_sparse, 1, &bind_sparse_info,
         vkd3d_queue_get_signal_fence_proxy_locked(queue)))) < 0)
-        ERR("Failed to perform sparse binding, vr %d.\n", vr);
+        d3d12_device_mark_as_removed(command_queue->device, hresult_from_vk_result(vr),
+                "Failed to perform sparse binding, vr %d.", vr);
 
     if (queue != queue_sparse)
         vkd3d_queue_release(queue_sparse);
@@ -25199,6 +25270,8 @@ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue
     pthread_mutex_unlock(&queue->queue_lock);
 }
 
+#include "helios_producer.h"
+
 static void d3d12_command_queue_acquire_serialized(struct d3d12_command_queue *queue)
 {
     /* In order to make sure all pending operations queued so far have been submitted,
@@ -25266,7 +25339,7 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
     queue->submission_thread_tid = vkd3d_get_current_thread_id();
 
     if (FAILED(hr = d3d12_command_queue_transition_pool_init(&pool, queue)))
-        ERR("Failed to initialize transition pool.\n");
+        d3d12_device_mark_as_removed(queue->device, hr, "Failed to initialize transition pool.");
 
     for (;;)
     {
@@ -25321,6 +25394,18 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
             VKD3D_REGION_BEGIN(queue_execute);
             cookie = vkd3d_queue_timeline_trace_register_generic_region(&queue->device->queue_timeline_trace, "EXECUTE");
 
+            if (!vkd3d_helios_execution_wait(queue, submission.execute.helios_execution))
+            {
+                /* Admission failed before any of this batch's command buffers
+                 * or initial transitions reached a Vulkan queue. */
+                for (i = 0; i < submission.execute.num_command_allocators; i++)
+                    d3d12_command_allocator_dec_ref(submission.execute.command_allocators[i]);
+                vkd3d_free(submission.execute.command_allocators);
+                vkd3d_queue_timeline_trace_complete_execute(&queue->device->queue_timeline_trace,
+                        NULL, submission.execute.timeline_cookie);
+                goto helios_execute_cleanup;
+            }
+
             memset(&transition_cmd, 0, sizeof(transition_cmd));
             transition_cmd.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
 
@@ -25340,6 +25425,11 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
                     &transition_semaphore.value);
 
             d3d12_command_queue_execute(queue, &submission.execute, &transition_cmd, &transition_semaphore);
+            vkd3d_helios_execution_signal(queue, submission.execute.helios_execution);
+
+helios_execute_cleanup:
+            vkd3d_helios_execution_free(submission.execute.helios_execution);
+
 
             /* command_queue_execute takes ownership of the
              * outstanding_submission_counters and queue_timeline_indices allocations.

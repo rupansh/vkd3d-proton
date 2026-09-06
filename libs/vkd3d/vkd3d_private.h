@@ -1199,6 +1199,7 @@ struct d3d12_resource
     d3d12_resource_iface ID3D12Resource_iface;
     LONG refcount;
     LONG internal_refcount;
+    struct vkd3d_helios_binding *helios_producer;
 
     D3D12_RESOURCE_DESC1 desc;
     D3D12_HEAP_PROPERTIES heap_properties;
@@ -3769,6 +3770,7 @@ struct d3d12_command_queue_submission_signal
 
 struct d3d12_command_queue_submission_execute
 {
+    struct vkd3d_helios_execution *helios_execution;
     VkCommandBufferSubmitInfo *cmd;
     uint32_t *cmd_cost;
     struct d3d12_command_allocator **command_allocators;
@@ -3876,6 +3878,8 @@ struct d3d12_command_queue
     d3d12_command_queue_vkd3d_ext_iface ID3D12CommandQueueExt_iface;
 
     LONG refcount;
+    struct vkd3d_helios_stream *helios_producer;
+    uint32_t helios_execution_cancelled;
 
     D3D12_COMMAND_QUEUE_DESC desc;
 
@@ -3943,6 +3947,9 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
         const D3D12_COMMAND_QUEUE_DESC *desc, uint32_t vk_family_index, struct d3d12_command_queue **queue);
 void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue);
 void d3d12_command_queue_signal_inline(struct d3d12_command_queue *queue, d3d12_fence_iface *fence, uint64_t value);
+void vkd3d_helios_binding_cleanup(struct d3d12_resource *resource);
+void vkd3d_helios_queue_cleanup(struct d3d12_command_queue *queue);
+
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata);
 void d3d12_command_queue_add_submission_locked(struct d3d12_command_queue *queue,
                                                const struct d3d12_command_queue_submission *sub);

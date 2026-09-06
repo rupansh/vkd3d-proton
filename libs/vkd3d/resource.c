@@ -2620,6 +2620,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_Map(d3d12_resource_iface *iface,
         return E_INVALIDARG;
     }
 
+    vkd3d_helios_binding_cleanup(resource);
+
     if (resource->flags & VKD3D_RESOURCE_RESERVED)
     {
         FIXME("Not implemented for this resource type.\n");

@@ -117,6 +117,12 @@ struct vkd3d_instance *vkd3d_instance_from_device(ID3D12Device *device);
 uint32_t vkd3d_get_vk_queue_family_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_flags(ID3D12CommandQueue *queue);
+/* Helios: exact allocation publication on the callback FIFO. The worker waits
+ * for runtime admission, then signals after preceding work. It retains both
+ * the resource and a duplicate event handle; the caller never drains it. */
+HRESULT helios_vkd3d_enqueue_producer(ID3D12CommandQueue *queue, ID3D12Resource *resource,
+        uint32_t allocation, HANDLE admission_event, uint32_t *ctx, uint32_t *value, uint64_t *cookie);
+
 VkQueue vkd3d_acquire_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_release_vk_queue(ID3D12CommandQueue *queue);
 VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue);
