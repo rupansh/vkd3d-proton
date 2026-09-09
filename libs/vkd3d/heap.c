@@ -87,13 +87,16 @@ static void d3d12_heap_destroy(struct d3d12_heap *heap)
 #endif
 
     vkd3d_free_memory(heap->device, &heap->device->memory_allocator, &heap->allocation);
+    pthread_mutex_destroy(&heap->helios_export_lock);
     vkd3d_private_store_destroy(&heap->private_store);
     vkd3d_free(heap);
 }
 
 static void d3d12_heap_set_name(struct d3d12_heap *heap, const char *name)
 {
-    if (!heap->allocation.chunk)
+    /* A deferred heap (OOM deferral or a pending Helios export heap) has no
+     * VkDeviceMemory to name yet. */
+    if (!heap->allocation.chunk && heap->allocation.device_allocation.vk_memory != VK_NULL_HANDLE)
         vkd3d_set_vk_object_name(heap->device, (uint64_t)heap->allocation.device_allocation.vk_memory,
                 VK_OBJECT_TYPE_DEVICE_MEMORY, name);
 }
@@ -299,11 +302,139 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
     return S_OK;
 }
 
+/* Helios: allocate the VkDeviceMemory of a pending VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT
+ * heap. Called by d3d12_resource_create_placed() for the heap's first placement, before
+ * anything is bound to the heap.
+ *
+ * dedicated_image != VK_NULL_HANDLE names a texture placed at offset zero that will be
+ * bound directly to the heap memory. The heap memory then becomes a
+ * VkMemoryDedicatedAllocateInfo allocation of that image, sized exactly to the image's
+ * requirements (VUID-VkMemoryAllocateInfo-pNext-02964 demands equality), with the
+ * OPAQUE_FD export chained as before. The host driver records the image's tiling
+ * metadata on the exported memory at fd-export time only for such dedicated image
+ * allocations, and a cross-process importer of the same memory needs that metadata to
+ * reconstruct the layout (RADV; see the flag's documentation).
+ *
+ * dedicated_image == VK_NULL_HANDLE is the heap's previous shape: a plain exportable,
+ * allocator-dedicated heap allocation of the heap's declared size, used when the base
+ * resource is a buffer, is not at offset zero, or binds the texture to a private
+ * device-local copy (VKD3D_RESOURCE_LINEAR_STAGING_COPY) rather than to the heap. */
+HRESULT d3d12_heap_helios_allocate_pending(struct d3d12_heap *heap, VkImage dedicated_image,
+        const VkMemoryRequirements *image_requirements)
+{
+    struct d3d12_device *device = heap->device;
+    struct vkd3d_allocate_heap_memory_info heap_alloc_info;
+    struct vkd3d_allocate_memory_info alloc_info;
+    VkMemoryDedicatedAllocateInfo dedicated_info;
+    VkExportMemoryAllocateInfo export_info;
+    HRESULT hr = S_OK;
+
+    pthread_mutex_lock(&heap->helios_export_lock);
+
+    if (!heap->helios_export_pending)
+    {
+        /* A concurrent placement already materialised the heap. */
+        pthread_mutex_unlock(&heap->helios_export_lock);
+        return S_OK;
+    }
+
+    assert(heap->desc.Flags & VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT);
+    assert(heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE);
+
+    memset(&export_info, 0, sizeof(export_info));
+    export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    if (dedicated_image != VK_NULL_HANDLE)
+    {
+        assert(image_requirements);
+
+        memset(&dedicated_info, 0, sizeof(dedicated_info));
+        dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicated_info.pNext = &export_info;
+        dedicated_info.image = dedicated_image;
+
+        /* Mirrors the committed-texture arm of d3d12_resource_create_committed():
+         * DEDICATED, no global buffer, the image's own requirements and memory
+         * type mask, heap properties/flags carried for clear policy and priority. */
+        memset(&alloc_info, 0, sizeof(alloc_info));
+        alloc_info.memory_requirements = *image_requirements;
+        alloc_info.heap_properties = heap->desc.Properties;
+        alloc_info.heap_flags = heap->desc.Flags;
+        alloc_info.pNext = &dedicated_info;
+        alloc_info.flags = VKD3D_ALLOCATION_FLAG_DEDICATED;
+        alloc_info.vk_memory_priority = heap->priority.residency_count ?
+                vkd3d_convert_to_vk_prio(heap->priority.d3d12priority) : 0.f;
+
+        if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
+            alloc_info.heap_flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
+        hr = vkd3d_allocate_memory(device, &device->memory_allocator, &alloc_info, &heap->allocation);
+    }
+    else
+    {
+        memset(&heap_alloc_info, 0, sizeof(heap_alloc_info));
+        heap_alloc_info.heap_desc = heap->desc;
+        heap_alloc_info.pNext = &export_info;
+        /* Allocator-dedicated: one venus resource id at offset zero, outside the
+         * suballocation pools. Not a VkMemoryDedicatedAllocateInfo - there is no
+         * image to dedicate this memory to. */
+        heap_alloc_info.extra_allocation_flags = VKD3D_ALLOCATION_FLAG_DEDICATED;
+        heap_alloc_info.vk_memory_priority = heap->priority.residency_count ?
+                vkd3d_convert_to_vk_prio(heap->priority.d3d12priority) : 0.f;
+
+        /* Same clear policy d3d12_heap_init() applies to every other heap. */
+        if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
+            heap_alloc_info.heap_desc.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        if ((heap_alloc_info.heap_desc.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) &&
+                VKD3D_CONFIG_FLAG_IS_SET(MEMORY_ALLOCATOR_SKIP_IMAGE_HEAP_CLEAR))
+            heap_alloc_info.heap_desc.Flags |= D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
+        hr = vkd3d_allocate_heap_memory(device, &device->memory_allocator, &heap_alloc_info, &heap->allocation);
+
+        /* vkd3d_allocate_heap_memory() legitimately hands back an empty allocation
+         * for a system-memory heap that denies buffers (and on OOM deferral). The
+         * heap then stops being pending with no memory, which is the shape
+         * d3d12_resource_create_placed() already resolves by creating a committed
+         * resource - with this heap's flags, so still exported and, for a texture,
+         * dedicated. */
+    }
+
+    if (FAILED(hr))
+    {
+        ERR("Failed to allocate Helios export heap memory (%s), hr %#x.\n",
+                dedicated_image != VK_NULL_HANDLE ? "dedicated image" : "plain", hr);
+        memset(&heap->allocation, 0, sizeof(heap->allocation));
+        pthread_mutex_unlock(&heap->helios_export_lock);
+        return hr;
+    }
+
+    heap->helios_export_pending = false;
+    heap->priority.allows_dynamic_residency =
+        device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
+        heap->allocation.chunk == NULL /* not suballocated */ &&
+        heap->allocation.device_allocation.vk_memory != VK_NULL_HANDLE &&
+        (device->memory_properties.memoryTypes[heap->allocation.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (VKD3D_CONFIG_FLAG_IS_SET(DEBUG_UTILS) && !heap->allocation.chunk &&
+            heap->allocation.device_allocation.vk_memory != VK_NULL_HANDLE)
+    {
+        char name_buffer[1024];
+        snprintf(name_buffer, sizeof(name_buffer), "Helios export heap %s (cookie %u)",
+                dedicated_image != VK_NULL_HANDLE ? "(dedicated image)" : "(plain)",
+                heap->allocation.resource.cookie.index);
+        vkd3d_set_vk_object_name(device, (uint64_t)heap->allocation.device_allocation.vk_memory,
+                VK_OBJECT_TYPE_DEVICE_MEMORY, name_buffer);
+    }
+
+    pthread_mutex_unlock(&heap->helios_export_lock);
+    return S_OK;
+}
+
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
         const D3D12_HEAP_DESC *desc, void* host_address)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
-    VkExportMemoryAllocateInfo export_info;
     HRESULT hr;
 
     memset(heap, 0, sizeof(*heap));
@@ -342,16 +473,14 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         /* Helios forwards the fused D3D12 heap+resource DDI as an explicit heap
          * with a resource placed at offset zero.  The heap, rather than a
          * committed resource, therefore owns the VkDeviceMemory that the WDDM
-         * allocation adopts.  Keep that allocation exportable and out of the
-         * allocator's suballocation pools so it has one venus resource id at
-         * offset zero.  This is allocator-dedicated, not a
-         * VkMemoryDedicatedAllocateInfo: child resources are allowed to alias
-         * the same D3D12 heap. */
-        memset(&export_info, 0, sizeof(export_info));
-        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-        export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-        alloc_info.pNext = &export_info;
-        alloc_info.extra_allocation_flags |= VKD3D_ALLOCATION_FLAG_DEDICATED;
+         * allocation adopts.  That memory is not allocated here: only the first
+         * placement knows whether the heap's base resource is a texture, and an
+         * exported texture must be a VkMemoryDedicatedAllocateInfo allocation of
+         * its VkImage for the host driver to attach the image's layout metadata
+         * to the exported memory (see VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT).
+         * d3d12_resource_create_placed() calls d3d12_heap_helios_allocate_pending()
+         * before it binds anything to the heap. */
+        heap->helios_export_pending = true;
     }
 
     if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
@@ -393,16 +522,26 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     alloc_info.vk_memory_priority = heap->priority.residency_count ?
         vkd3d_convert_to_vk_prio(heap->priority.d3d12priority) : 0.f;
 
-    if (FAILED(hr = vkd3d_allocate_heap_memory(device,
+    pthread_mutex_init(&heap->helios_export_lock, NULL);
+
+    if (heap->helios_export_pending)
+    {
+        /* Deferred: d3d12_heap_helios_allocate_pending() fills heap->allocation
+         * and heap->priority.allows_dynamic_residency at the first placement. */
+        memset(&heap->allocation, 0, sizeof(heap->allocation));
+    }
+    else if (FAILED(hr = vkd3d_allocate_heap_memory(device,
             &device->memory_allocator, &alloc_info, &heap->allocation)))
     {
+        pthread_mutex_destroy(&heap->helios_export_lock);
         vkd3d_private_store_destroy(&heap->private_store);
         return hr;
     }
 
-    heap->priority.allows_dynamic_residency = 
+    heap->priority.allows_dynamic_residency = !heap->helios_export_pending &&
         device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
         heap->allocation.chunk == NULL /* not suballocated */ &&
+        heap->allocation.device_allocation.vk_memory != VK_NULL_HANDLE &&
         (device->memory_properties.memoryTypes[heap->allocation.device_allocation.vk_memory_type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,

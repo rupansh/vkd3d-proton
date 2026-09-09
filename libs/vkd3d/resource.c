@@ -4661,7 +4661,25 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
     if (FAILED(hr = d3d12_resource_validate_heap(desc, heap)))
         return hr;
 
-    if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE)
+    /* Helios: a pending export heap allocates its memory here, at its first
+     * placement. A texture placed at offset zero on a GPU-local heap dedicates the
+     * exported memory to its own VkImage further down, once that image exists
+     * (see VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT). Every other first placement -
+     * a buffer, a non-zero offset, or a CPU-accessible heap whose texture binds
+     * to a private staging copy - materialises the plain exportable heap now. */
+    if (heap->helios_export_pending &&
+            (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || heap_offset != 0 ||
+             is_cpu_accessible_heap(&heap->desc.Properties)))
+    {
+        if (heap_offset != 0 && desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+            WARN("Helios export heap %p materialised by a texture at offset %"PRIu64"; the exported memory carries no image layout metadata.\n",
+                    heap, heap_offset);
+
+        if (FAILED(hr = d3d12_heap_helios_allocate_pending(heap, VK_NULL_HANDLE, NULL)))
+            return hr;
+    }
+
+    if (heap->allocation.device_allocation.vk_memory == VK_NULL_HANDLE && !heap->helios_export_pending)
     {
         WARN("Placing resource on heap with no memory backing it. Falling back to committed resource.\n");
 
@@ -4713,6 +4731,21 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
         /* Align manually. This works because we padded the required allocation size reported to the app. */
         VK_CALL(vkGetImageMemoryRequirements(device->vk_device, object->res.vk_image, &memory_requirements));
+
+        if (heap->helios_export_pending)
+        {
+            /* The heap's base resource (see the pending check above): the exported
+             * heap memory becomes a dedicated allocation of this image, exactly its
+             * size, so the host driver stamps the image's layout on the export.
+             * heap->allocation.resource.size is then the image size rather than
+             * the declared heap size; the fused DDI shape only ever places this
+             * one resource, at offset zero, and it fits by construction. */
+            assert(heap_offset == 0);
+            assert(!(object->flags & VKD3D_RESOURCE_LINEAR_STAGING_COPY));
+
+            if (FAILED(hr = d3d12_heap_helios_allocate_pending(heap, object->res.vk_image, &memory_requirements)))
+                goto fail;
+        }
 
         /* For SMALL_RESOURCE_PLACEMENT when we have workaround active,
          * verify that application did in fact check alignment requirements.

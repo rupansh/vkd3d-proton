@@ -1033,6 +1033,14 @@ struct d3d12_heap
     D3D12_HEAP_DESC desc;
     struct vkd3d_memory_allocation allocation;
 
+    /* Helios: a VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT heap does not allocate its
+     * VkDeviceMemory in d3d12_heap_init(). The first placement materialises it
+     * through d3d12_heap_helios_allocate_pending(), so that a texture placed at
+     * offset zero can make the exported memory a dedicated allocation of its own
+     * VkImage. See the flag's documentation for why that is required. */
+    bool helios_export_pending;
+    pthread_mutex_t helios_export_lock;
+
     priority_info priority;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
@@ -1049,6 +1057,8 @@ struct d3d12_heap
 
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
         void *host_address, struct d3d12_heap **heap);
+HRESULT d3d12_heap_helios_allocate_pending(struct d3d12_heap *heap, VkImage dedicated_image,
+        const VkMemoryRequirements *image_requirements);
 HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties);
 
@@ -1115,7 +1125,28 @@ enum vkd3d_resource_flag
  * umd12/src/forward12/resource12.rs's HELIOS_HEAP_FLAG_VENUS_EXPORT. THIS
  * declaration is the authority; the two must be kept in sync by hand, because the
  * D3D12 API word is the only channel between them and neither side can see the
- * other's header. */
+ * other's header.
+ *
+ * Heaps carrying this flag allocate their memory LATE, at the first placement,
+ * and a texture placed at offset zero turns that allocation into a
+ * VkMemoryDedicatedAllocateInfo allocation of its VkImage (d3d12_heap_init(),
+ * d3d12_heap_helios_allocate_pending(), d3d12_resource_create_placed()). The UMD
+ * forwards the fused D3D12 heap+resource DDI - every swapchain back buffer - as an
+ * explicit heap with the texture placed at offset zero, so without this the
+ * exported memory would only ever be a plain buffer-backed heap allocation.
+ *
+ * Why the dedicated image matters: the memory is opened by another process
+ * (DWM, through the D3D11 UMD and DXVK) as a dedicated import of ITS image. Host
+ * drivers that choose an image's memory layout per image, RADV being the one that
+ * ships under Helios, describe the exporter's layout through metadata attached
+ * to the exported memory - and RADV only writes that metadata when the exported
+ * VkDeviceMemory is a dedicated allocation of an image (radv_GetMemoryFdKHR ->
+ * radv_image_bo_set_metadata). On import it re-derives the importing image's
+ * layout from the same metadata and falls back to LINEAR when there is none
+ * (radv_patch_surface_from_metadata). A buffer-backed export therefore made DWM
+ * read every D3D12 back buffer as linear rows while the app wrote 64 KB tiles:
+ * the "horizontal stripes" picture from every D3D12 present on AMD. NVIDIA's layout
+ * is a pure function of the create parameters, so the same code worked there. */
 #define VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT ((D3D12_HEAP_FLAGS)(1u << 30))
 
 #define VKD3D_INVALID_TILE_INDEX (~0u)
