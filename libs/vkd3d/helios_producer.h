@@ -99,7 +99,10 @@ static bool vkd3d_helios_commit_execute(struct d3d12_command_queue *queue,
     {
         stream = queue->helios_producer;
         op->value = ++stream->value;
-        sub->execute.helios_execution = op;
+        if (sub->type == VKD3D_SUBMISSION_BIND_SPARSE)
+            sub->bind_sparse.helios_execution = op;
+        else
+            sub->execute.helios_execution = op;
         /* Outputs are written before the worker can own/free op. */
         *ctx = stream->ctx; *value = (uint32_t)op->value; *cookie = stream->cookie;
         d3d12_command_queue_add_submission_locked(queue, sub);

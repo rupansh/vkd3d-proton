@@ -542,7 +542,15 @@ uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
     if (aux_quirks)
         *aux_quirks = quirks;
 
-    return quirk_hash ^ 1;
+    /* Helios revision 2: DXBC immediate constant buffers use raw integer
+     * storage with zero-padded bounds handling, including pointer aliases.
+     * Dirty development builds retain the same Git build tag, so invalidate
+     * their cached SPIR-V and PSOs through the shader interface key as well. */
+    /* Revision 3 also specializes rasterizer sample-count intrinsics from the
+     * effective no-output TIR count, rather than ignoring ForcedSampleCount. */
+    /* Revision 4 normalizes forced-one-sample coverage and uses early queries. */
+    /* Revision 5 translates single-sample TIR output coverage and A2C. */
+    return quirk_hash ^ 5;
 }
 
 struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,

@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 layout(local_size_x = 64) in;
 
@@ -20,6 +21,7 @@ struct query_map_entry_t {
   uint dst_index;
   uint src_index;
   uint next;
+  uint occlusion_divisor;
 };
 
 layout(std430, buffer_reference, buffer_reference_align = 4)
@@ -33,6 +35,7 @@ uniform u_info_t {
   src_queries_t src_buffer;
   query_map_t query_map;
   uint query_count;
+  uint query_base;
 };
 
 uvec2 uadd64(uvec2 a, uvec2 b) {
@@ -42,30 +45,53 @@ uvec2 uadd64(uvec2 a, uvec2 b) {
   return uvec2(lo, hi);
 }
 
-void main() {
-  uint thread_id = gl_GlobalInvocationID.x;
+uvec2 query_address(uvec2 base, uint index) {
+  uint high, low;
+  // A query can contain eleven uint64 fields. Multiplying its uint index
+  // before BDA indexing wraps on legal heaps larger than 32 GiB.
+  umulExtended(index, 8 * c_field_count, high, low);
+  return uadd64(base, uvec2(low, high));
+}
 
-  if (thread_id >= query_count)
+uvec2 normalize_samples(uvec2 value, uint divisor) {
+  if (divisor <= 1)
+    return value;
+  // Divisors are popcounts of a 32-bit output mask. Divide using 16-bit
+  // limbs so all intermediates fit uint, including results above 2^32.
+  uint high = value.y / divisor;
+  uint middle = ((value.y % divisor) << 16) | (value.x >> 16);
+  uint low = ((middle % divisor) << 16) | (value.x & 0xffffu);
+  return uvec2(((middle / divisor) << 16) | (low / divisor), high);
+}
+
+void main() {
+  uint local_id = gl_GlobalInvocationID.x;
+
+  if (local_id >= query_count - query_base)
     return;
+  uint thread_id = query_base + local_id;
 
   // The query map is an array of linked lists, with the
   // first query_count entries guaranteed to be list heads
   query_map_entry_t entry = query_map.entries[thread_id];
   uvec2 dst_data[c_field_count];
+  src_queries_t source = src_queries_t(query_address(uvec2(src_buffer), entry.src_index));
 
   // By copying the first query we get the reset for free
   for (uint i = 0; i < c_field_count; i++)
-    dst_data[i] = src_buffer.queries[c_field_count * entry.src_index + i];
+    dst_data[i] = normalize_samples(source.queries[i], entry.occlusion_divisor);
 
   // Accumulate data from additional queries
   while (entry.next != ~0u) {
     entry = query_map.entries[entry.next];
+    source = src_queries_t(query_address(uvec2(src_buffer), entry.src_index));
 
     for (uint i = 0; i < c_field_count; i++)
-      dst_data[i] = uadd64(dst_data[i], src_buffer.queries[c_field_count * entry.src_index + i]);
+      dst_data[i] = uadd64(dst_data[i], normalize_samples(source.queries[i], entry.occlusion_divisor));
   }
 
   // dst_index has the same value for all entries in the list
+  dst_queries_t destination = dst_queries_t(query_address(uvec2(dst_buffer), entry.dst_index));
   for (uint i = 0; i < c_field_count; i++)
-    dst_buffer.queries[c_field_count * entry.dst_index + i] = dst_data[i];
+    destination.queries[i] = dst_data[i];
 }

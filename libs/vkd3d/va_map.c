@@ -261,7 +261,7 @@ void vkd3d_va_map_try_read_rtas(struct vkd3d_va_map *va_map,
     *rtas_kind = VKD3D_RTAS_KIND_UNKNOWN;
 
     resource = vkd3d_va_map_deref(va_map, va);
-    if (!resource || !resource->va)
+    if (!resource || !resource->va || va < resource->va || va - resource->va >= resource->size)
         return;
 
     view_map = vkd3d_atomic_ptr_load_explicit(&resource->view_map, vkd3d_memory_order_acquire);
@@ -309,7 +309,7 @@ VkAccelerationStructureKHR vkd3d_va_map_place_acceleration_structure(struct vkd3
     struct vkd3d_view *view;
 
     resource = vkd3d_va_map_deref_mutable(va_map, va);
-    if (!resource || !resource->va)
+    if (!resource || !resource->va || va < resource->va || va - resource->va >= resource->size)
         return VK_NULL_HANDLE;
 
     view_map = vkd3d_atomic_ptr_load_explicit(&resource->view_map, vkd3d_memory_order_acquire);

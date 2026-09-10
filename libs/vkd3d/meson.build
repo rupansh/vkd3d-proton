@@ -20,6 +20,7 @@ vkd3d_shaders =[
   'shaders/cs_resolve_binary_queries.comp',
   'shaders/cs_resolve_predicate.comp',
   'shaders/cs_resolve_query.comp',
+  'shaders/cs_dgc_query.comp',
 
   'shaders/fs_copy_image_float.frag',
   'shaders/fs_copy_image_uint.frag',
@@ -35,6 +36,11 @@ vkd3d_shaders =[
   'shaders/cs_execute_indirect_patch.comp',
   'shaders/cs_execute_indirect_patch_debug_ring.comp',
   'shaders/cs_execute_indirect_multi_dispatch.comp',
+  'shaders/cs_tiled_copy_write.comp',
+  'shaders/cs_tiled_copy_read.comp',
+  'shaders/cs_tiled_copy_rows.comp',
+  'shaders/cs_tiled_copy_depth.comp',
+  'shaders/fs_tiled_copy_depth.frag',
 
   'shaders/cs_sampler_feedback_decode_buffer_min_mip.comp',
   'shaders/fs_sampler_feedback_decode_image_min_mip.frag',
@@ -64,6 +70,7 @@ vkd3d_shaders =[
 ]
 
 vkd3d_src = [
+  'rtas_deserialize.c',
   'bundle.c',
   'cache.c',
   'command.c',

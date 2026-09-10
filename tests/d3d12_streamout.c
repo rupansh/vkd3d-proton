@@ -178,7 +178,63 @@ void test_primitive_restart_list_topology_stream_output(void)
     destroy_test_context(&context);
 }
 
-static void test_vertex_shader_stream_output(bool use_dxil)
+static HRESULT create_stream_output_pipeline_stream(ID3D12Device *device,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, bool physical, ID3D12PipelineState **pipeline)
+{
+    struct
+    {
+        union d3d12_root_signature_subobject root;
+        union d3d12_shader_bytecode_subobject vs;
+        union d3d12_stream_output_subobject so;
+        union d3d12_primitive_topology_subobject topology;
+        union d3d12_depth_stencil_subobject depth_stencil;
+        union d3d12_rasterizer_subobject rasterizer;
+        union d3d12_sample_desc_subobject sample;
+        union d3d12_cached_pso_subobject cached;
+    } stream =
+    {
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, desc->pRootSignature}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc->VS}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, desc->StreamOutput}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, desc->PrimitiveTopologyType}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, desc->DepthStencilState}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, desc->RasterizerState}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, desc->SampleDesc}},
+        {{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, desc->CachedPSO}},
+    };
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = {sizeof(stream), &stream};
+    ID3D12Device2 *device2;
+    HRESULT hr;
+
+    if (physical)
+    {
+#ifndef _WIN32
+        HRESULT (*create_native_so)(ID3D12Device *, const D3D12_PIPELINE_STATE_STREAM_DESC *, ID3D12PipelineState **);
+        Dl_info module_info;
+        void *module;
+        /* Use the same loaded engine that owns device. Linking another static
+         * copy here would not validate the native bridge's actual factory.
+         * The loader uses RTLD_LOCAL, so RTLD_DEFAULT cannot find this symbol. */
+        if (!dladdr((void *)device->lpVtbl->CreateGraphicsPipelineState, &module_info) ||
+                !(module = dlopen(module_info.dli_fname, RTLD_NOW | RTLD_NOLOAD)))
+            return E_NOINTERFACE;
+        create_native_so = dlsym(module, "helios_vkd3d_create_stream_output_pipeline");
+        hr = create_native_so ? create_native_so(device, &stream_desc, pipeline) : E_NOINTERFACE;
+        dlclose(module);
+        return hr;
+#else
+        return E_NOTIMPL;
+#endif
+    }
+    if (FAILED(hr = ID3D12Device_QueryInterface(device, &IID_ID3D12Device2, (void **)&device2)))
+        return hr;
+    hr = ID3D12Device2_CreatePipelineState(device2, &stream_desc, &IID_ID3D12PipelineState, (void **)pipeline);
+    ID3D12Device2_Release(device2);
+    return hr;
+}
+
+static void test_vertex_shader_stream_output(bool use_dxil, bool partial, bool user_output,
+        bool physical, unsigned int semantic_collision)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
     ID3D12Resource *counter_buffer, *so_buffer;
@@ -198,6 +254,33 @@ static void test_vertex_shader_stream_output(bool use_dxil)
     {
         {0, "SV_Position", 0, 0, 4, 0},
     };
+    static const D3D12_SO_DECLARATION_ENTRY partial_declaration[] =
+    {
+        {0, "SV_Position", 0, 1, 2, 0},
+        {0, NULL, 0, 0, 1, 0},
+        {0, "SV_Position", 0, 0, 1, 0},
+    };
+    static const D3D12_SO_DECLARATION_ENTRY user_declaration[] =
+    {
+        {0, "UV_TEXCOORD", 0, 1, 1, 0},
+        {0, NULL, 0, 0, 1, 0},
+        {0, "UV_TEXCOORD", 0, 0, 1, 0},
+        {0, NULL, 0, 0, 1, 0},
+    };
+    static const D3D12_SO_DECLARATION_ENTRY physical_declaration[] =
+    {
+        {0, "__HELIOS_DDI_SO_REGISTER", 0, 1, 2, 0},
+        {0, NULL, 0, 0, 1, 0},
+        {0, "__HELIOS_DDI_SO_REGISTER", 0, 0, 1, 0},
+    };
+    static const D3D12_SO_DECLARATION_ENTRY collision_declaration[] =
+    {
+        {0, "__HELIOS_DDI_SO_REGISTER", 7, 1, 2, 0},
+        {0, NULL, 0, 0, 1, 0},
+        {0, "__HELIOS_DDI_SO_REGISTER", 7, 0, 1, 0},
+    };
+#include "shaders/sparse/headers/texture_feedback_vs.h"
+#include "shaders/pso/headers/stream_output_marker_semantic.h"
     static const struct vec4 expected_output[] =
     {
         {-1.0f, 1.0f, 0.0f, 1.0f},
@@ -226,13 +309,30 @@ static void test_vertex_shader_stream_output(bool use_dxil)
         init_pipeline_state_desc_dxil(&pso_desc, context.root_signature, 0, NULL, NULL, NULL);
     else
         init_pipeline_state_desc(&pso_desc, context.root_signature, 0, NULL, NULL, NULL);
-    pso_desc.StreamOutput.NumEntries = ARRAY_SIZE(so_declaration);
-    pso_desc.StreamOutput.pSODeclaration = so_declaration;
+    if (user_output)
+        pso_desc.VS = use_dxil ? texture_feedback_vs_dxil : texture_feedback_vs_dxbc;
+    pso_desc.StreamOutput.NumEntries = partial ? ARRAY_SIZE(partial_declaration) : ARRAY_SIZE(so_declaration);
+    pso_desc.StreamOutput.pSODeclaration = partial ? partial_declaration : so_declaration;
+    if (user_output)
+    {
+        pso_desc.StreamOutput.NumEntries = ARRAY_SIZE(user_declaration);
+        pso_desc.StreamOutput.pSODeclaration = user_declaration;
+    }
+    else if (physical)
+        pso_desc.StreamOutput.pSODeclaration = physical_declaration;
+    else if (semantic_collision)
+    {
+        pso_desc.VS = stream_output_marker_semantic_dxil;
+        pso_desc.StreamOutput.pSODeclaration = collision_declaration;
+    }
     pso_desc.StreamOutput.pBufferStrides = strides;
     pso_desc.StreamOutput.NumStrides = ARRAY_SIZE(strides);
     pso_desc.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
-    hr = ID3D12Device_CreateGraphicsPipelineState(device, &pso_desc,
-            &IID_ID3D12PipelineState, (void **)&context.pipeline_state);
+    if (physical || semantic_collision == 2)
+        hr = create_stream_output_pipeline_stream(device, &pso_desc, physical, &context.pipeline_state);
+    else
+        hr = ID3D12Device_CreateGraphicsPipelineState(device, &pso_desc,
+                &IID_ID3D12PipelineState, (void **)&context.pipeline_state);
     if (hr == E_NOTIMPL)
     {
         skip("Stream output is not supported.\n");
@@ -240,6 +340,38 @@ static void test_vertex_shader_stream_output(bool use_dxil)
         return;
     }
     ok(hr == S_OK, "Failed to create graphics pipeline state, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        destroy_test_context(&context);
+        return;
+    }
+    if (semantic_collision)
+    {
+        ID3DBlob *cached;
+        hr = ID3D12PipelineState_GetCachedBlob(context.pipeline_state, &cached);
+        ok(hr == S_OK, "Failed to get cached SO pipeline, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+        {
+            destroy_test_context(&context);
+            return;
+        }
+        ID3D12PipelineState_Release(context.pipeline_state);
+        context.pipeline_state = NULL;
+        pso_desc.CachedPSO.pCachedBlob = ID3D10Blob_GetBufferPointer(cached);
+        pso_desc.CachedPSO.CachedBlobSizeInBytes = ID3D10Blob_GetBufferSize(cached);
+        if (semantic_collision == 2)
+            hr = create_stream_output_pipeline_stream(device, &pso_desc, false, &context.pipeline_state);
+        else
+            hr = ID3D12Device_CreateGraphicsPipelineState(device, &pso_desc,
+                    &IID_ID3D12PipelineState, (void **)&context.pipeline_state);
+        ID3D10Blob_Release(cached);
+        ok(hr == S_OK, "Failed to recreate cached SO pipeline, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+        {
+            destroy_test_context(&context);
+            return;
+        }
+    }
 
     counter = 0;
     upload_buffer = create_upload_buffer(device, sizeof(counter), &counter);
@@ -265,6 +397,11 @@ static void test_vertex_shader_stream_output(bool use_dxil)
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(command_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D12GraphicsCommandList_SOSetTargets(command_list, 0, 1, &sobv);
     ID3D12GraphicsCommandList_DrawInstanced(command_list, 3, 1, 0, 0);
+    /* A NULL array unbinds the requested slot count. The buffer has ample
+     * capacity; another draw must not append to the former target. */
+    ID3D12GraphicsCommandList_SOSetTargets(command_list, 0, 1, NULL);
+    ID3D12GraphicsCommandList_DrawInstanced(command_list, 3, 1, 3, 0);
+
 
     transition_resource_state(command_list, counter_buffer,
             D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -281,9 +418,24 @@ static void test_vertex_shader_stream_output(bool use_dxil)
     {
         const struct vec4 *expected = &expected_output[i];
         data = get_readback_vec4(&rb, i, 0);
-        ok(compare_vec4(data, expected, 1),
-                "Got {%.8e, %.8e, %.8e, %.8e}, expected {%.8e, %.8e, %.8e, %.8e}.\n",
-                data->x, data->y, data->z, data->w, expected->x, expected->y, expected->z, expected->w);
+        if (user_output)
+        {
+            ok(compare_float(data->x, (1.0f - expected->y) / 2.0f, 1) &&
+                    compare_float(data->z, (expected->x + 1.0f) / 2.0f, 1),
+                    "User partial capture %u: got {%g, gap, %g, gap}.\n", i, data->x, data->z);
+        }
+        else
+        if (partial)
+        {
+            ok(compare_float(data->x, expected->y, 1) && compare_float(data->y, expected->z, 1)
+                    && compare_float(data->w, expected->x, 1),
+                    "Partial capture %u: got {%g, %g, gap, %g}, expected {%g, %g, gap, %g}.\n",
+                    i, data->x, data->y, data->w, expected->y, expected->z, expected->x);
+        }
+        else
+            ok(compare_vec4(data, expected, 1),
+                    "Got {%.8e, %.8e, %.8e, %.8e}, expected {%.8e, %.8e, %.8e, %.8e}.\n",
+                    data->x, data->y, data->z, data->w, expected->x, expected->y, expected->z, expected->w);
     }
     release_resource_readback(&rb);
 
@@ -441,10 +593,334 @@ void test_index_buffer_edge_case_stream_output(void)
 
 void test_vertex_shader_stream_output_dxbc(void)
 {
-    test_vertex_shader_stream_output(false);
+    test_vertex_shader_stream_output(false, false, false, false, 0);
 }
 
 void test_vertex_shader_stream_output_dxil(void)
 {
-    test_vertex_shader_stream_output(true);
+    test_vertex_shader_stream_output(true, false, false, false, 0);
+}
+
+void test_vertex_shader_stream_output_partial_dxil(void)
+{
+    test_vertex_shader_stream_output(true, true, false, false, 0);
+}
+
+void test_vertex_shader_stream_output_partial_dxbc(void)
+{
+    test_vertex_shader_stream_output(false, true, false, false, 0);
+}
+
+void test_vertex_shader_stream_output_partial_user_dxil(void)
+{
+    test_vertex_shader_stream_output(true, true, true, false, 0);
+}
+
+void test_vertex_shader_stream_output_partial_user_dxbc(void)
+{
+    test_vertex_shader_stream_output(false, true, true, false, 0);
+}
+
+void test_vertex_shader_stream_output_partial_physical_dxil(void)
+{
+#ifdef _WIN32
+    skip("Private native-DDI SO factory is tested in the Linux engine harness; native Windows uses the Helios SO probe.\n");
+#else
+    test_vertex_shader_stream_output(true, true, false, true, 0);
+#endif
+}
+
+void test_vertex_shader_stream_output_marker_semantic_dxil(void)
+{
+    test_vertex_shader_stream_output(true, true, false, false, 1);
+}
+
+void test_vertex_shader_stream_output_marker_semantic_stream_dxil(void)
+{
+    test_vertex_shader_stream_output(true, true, false, false, 2);
+}
+
+static void test_null_stream_output_targets(bool use_dxil)
+{
+    const unsigned int counter_heap_size = 4 * 1024 * 1024;
+    const unsigned int counter_base = counter_heap_size - 16;
+    static const unsigned int tested_strides[] = {4, 8, 16, 32};
+    static const struct vec4 positions[] =
+    {
+        {-1.0f, 1.0f, 0.0f, 1.0f},
+        { 3.0f, 1.0f, 0.0f, 1.0f},
+        {-1.0f,-3.0f, 0.0f, 1.0f},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input =
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+#include "shaders/sparse/headers/texture_feedback_vs.h"
+#include "shaders/pso/headers/vs_mismatch.h"
+#include "shaders/pso/headers/stream_output_two_streams.h"
+    D3D12_SO_DECLARATION_ENTRY entries[2];
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW views[2], limited;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
+    D3D12_QUERY_HEAP_DESC query_desc;
+    D3D12_HEAP_DESC heap_desc;
+    D3D12_VERTEX_BUFFER_VIEW vbv;
+    ID3D12Resource *buffers[2], *counters, *upload, *observations, *vertices;
+    ID3D12GraphicsCommandList *list;
+    ID3D12PipelineState *pso;
+    ID3D12Heap *counter_heap;
+    ID3D12QueryHeap *queries;
+    struct test_context_desc desc;
+    struct test_context context;
+    struct resource_readback rb;
+    unsigned int stride_index, mode, multi, slot, word, vertex, component, sequence;
+    unsigned int initial[2], blocked[2], resumed[2], total[2], strides[2];
+    uint32_t initial_data[256];
+    uint64_t value, expected;
+    const float *floats;
+    float expected_float;
+    HRESULT hr;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.no_pipeline = true;
+    desc.root_signature_flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT |
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    if (!init_test_context(&context, &desc))
+        return;
+    if (use_dxil && !context_supports_dxil(&context))
+    {
+        destroy_test_context(&context);
+        return;
+    }
+
+    list = context.list;
+    for (multi = 0; multi <= (unsigned int)use_dxil; ++multi)
+    for (stride_index = 0; stride_index < ARRAY_SIZE(tested_strides); ++stride_index)
+    for (mode = 0; mode < (multi ? 4u : 5u); ++mode)
+    {
+        /* Declared but unbound slots are full buffers (D3D11.3 14.6), so they
+         * block every buffer in that stream, but never an independent stream.
+         * Small strides expose finite dummy-buffer capacity; stride 32 is the
+         * control. Modes exercise initial NULL, explicit NULL, zero size with
+         * ignored invalid addresses, and an actual buffer with one slot left.
+         * The last mode omits slot 0 from the declaration altogether: its data
+         * and counter must remain untouched whether bound or unbound. */
+        vkd3d_test_set_context("%s, stride %u, mode %u", multi ? "two streams" : "one stream",
+                tested_strides[stride_index], mode);
+        strides[0] = tested_strides[stride_index];
+        strides[1] = multi ? 8 : 16;
+        memset(entries, 0, sizeof(entries));
+        entries[0].SemanticName = multi ? "ARG" : "UV_TEXCOORD";
+        entries[0].ComponentCount = 1;
+        entries[1].Stream = multi;
+        entries[1].SemanticName = multi ? "ARG" : "SV_Position";
+        entries[1].SemanticIndex = multi;
+        entries[1].ComponentCount = multi ? 2 : 4;
+        entries[1].OutputSlot = 1;
+        init_pipeline_state_desc(&pso_desc, context.root_signature, DXGI_FORMAT_UNKNOWN,
+                multi ? &vs_mismatch_dxil : use_dxil ? &texture_feedback_vs_dxil : &texture_feedback_vs_dxbc,
+                NULL, NULL);
+        memset(&pso_desc.PS, 0, sizeof(pso_desc.PS));
+        pso_desc.NumRenderTargets = 0;
+        pso_desc.PrimitiveTopologyType = multi ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE :
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        if (multi)
+        {
+            pso_desc.GS = stream_output_two_streams_dxil;
+            pso_desc.InputLayout.NumElements = 1;
+            pso_desc.InputLayout.pInputElementDescs = &input;
+        }
+        pso_desc.StreamOutput.pSODeclaration = entries + (mode == 4);
+        pso_desc.StreamOutput.NumEntries = ARRAY_SIZE(entries) - (mode == 4);
+        pso_desc.StreamOutput.pBufferStrides = strides;
+        pso_desc.StreamOutput.NumStrides = ARRAY_SIZE(strides);
+        pso_desc.StreamOutput.RasterizedStream = D3D12_SO_NO_RASTERIZED_STREAM;
+        hr = ID3D12Device_CreateGraphicsPipelineState(context.device, &pso_desc,
+                &IID_ID3D12PipelineState, (void **)&pso);
+        ok(hr == S_OK, "Failed to create stream-output PSO, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            continue;
+
+        memset(initial_data, 0xcd, sizeof(initial_data));
+        initial_data[1] = initial_data[3] = 0;
+        if (mode == 4)
+            initial_data[1] = 124;
+        upload = create_upload_buffer(context.device, sizeof(initial_data), initial_data);
+        vertices = create_upload_buffer(context.device, sizeof(positions), positions);
+        /* BufferFilledSize is 32 bits. The last counter occupies exactly the
+         * heap's last four bytes, so allocation padding cannot conceal an
+         * incorrect eight-byte range requirement. Each counter has a preceding
+         * sentinel, including one immediately after the first counter. */
+        memset(&heap_desc, 0, sizeof(heap_desc));
+        heap_desc.SizeInBytes = counter_heap_size;
+        heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        hr = ID3D12Device_CreateHeap(context.device, &heap_desc, &IID_ID3D12Heap, (void **)&counter_heap);
+        ok(hr == S_OK, "Failed to create counter heap, hr %#x.\n", (int)hr);
+        counters = create_placed_buffer(context.device, counter_heap, 0, counter_heap_size,
+                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        observations = create_default_buffer(context.device, 640, D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        memset(&query_desc, 0, sizeof(query_desc));
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_SO_STATISTICS;
+        query_desc.Count = 4;
+        hr = ID3D12Device_CreateQueryHeap(context.device, &query_desc, &IID_ID3D12QueryHeap, (void **)&queries);
+        ok(hr == S_OK, "Failed to create query heap, hr %#x.\n", (int)hr);
+        for (slot = 0; slot < 2; ++slot)
+        {
+            buffers[slot] = create_default_buffer(context.device, 256, D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            ID3D12GraphicsCommandList_CopyBufferRegion(list, buffers[slot], 0, upload, 16, 256);
+            transition_resource_state(list, buffers[slot], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+            views[slot].BufferLocation = ID3D12Resource_GetGPUVirtualAddress(buffers[slot]);
+            views[slot].SizeInBytes = 256;
+            views[slot].BufferFilledSizeLocation = ID3D12Resource_GetGPUVirtualAddress(counters) + counter_base + slot * 8 + 4;
+            initial[slot] = mode ? (slot && multi ? 1 : 3) : 0;
+            blocked[slot] = slot && multi ? 1 : mode == 3 ? 1 : 0;
+            resumed[slot] = slot && multi ? 1 : 3;
+            if (mode == 4)
+            {
+                initial[slot] = resumed[slot] = slot ? 3 : 0;
+                blocked[slot] = slot ? 3 : 0;
+            }
+            total[slot] = initial[slot] + blocked[slot] + resumed[slot];
+        }
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, counters, counter_base, upload, 0, 16);
+        transition_resource_state(list, counters, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_STREAM_OUT);
+        ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &context.scissor_rect);
+        ID3D12GraphicsCommandList_RSSetViewports(list, 1, &context.viewport);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, context.root_signature);
+        ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list,
+                multi ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST : D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        if (multi)
+        {
+            vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vertices);
+            vbv.SizeInBytes = sizeof(positions);
+            vbv.StrideInBytes = sizeof(positions[0]);
+            ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        }
+        if (mode)
+        {
+            ID3D12GraphicsCommandList_SOSetTargets(list, 0, 2, views);
+            ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+        }
+        else
+            ID3D12GraphicsCommandList_SOSetTargets(list, 1, 1, &views[1]);
+
+        if (mode == 1 || mode == 4)
+            ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, NULL);
+        else if (mode == 2)
+        {
+            limited.BufferLocation = 1;
+            limited.SizeInBytes = 0;
+            limited.BufferFilledSizeLocation = UINT64_MAX;
+            ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &limited);
+        }
+        else if (mode == 3)
+        {
+            limited = views[0];
+            limited.SizeInBytes = (initial[0] + 1) * strides[0];
+            ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &limited);
+        }
+        for (slot = 0; slot <= multi; ++slot)
+            ID3D12GraphicsCommandList_BeginQuery(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot, slot);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+        for (slot = 0; slot <= multi; ++slot)
+        {
+            ID3D12GraphicsCommandList_EndQuery(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot, slot);
+            ID3D12GraphicsCommandList_ResolveQueryData(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot,
+                    slot, 1, observations, 544 + slot * 16);
+        }
+        transition_resource_state(list, counters, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, observations, 528, counters, counter_base, 16);
+        transition_resource_state(list, counters, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_STREAM_OUT);
+
+        /* The other logical target remains bound. Rebind only slot 0 and verify
+         * that the saved counters survive query/copy render-pass boundaries. */
+        ID3D12GraphicsCommandList_SOSetTargets(list, 0, 1, &views[0]);
+        for (slot = 0; slot <= multi; ++slot)
+            ID3D12GraphicsCommandList_BeginQuery(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot, 2 + slot);
+        ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+        for (slot = 0; slot <= multi; ++slot)
+        {
+            ID3D12GraphicsCommandList_EndQuery(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot, 2 + slot);
+            ID3D12GraphicsCommandList_ResolveQueryData(list, queries, D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 + slot,
+                    2 + slot, 1, observations, 576 + slot * 16);
+        }
+        ID3D12GraphicsCommandList_SOSetTargets(list, 0, 2, NULL);
+        transition_resource_state(list, counters, D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, observations, 512, counters, counter_base, 16);
+        for (slot = 0; slot < 2; ++slot)
+        {
+            transition_resource_state(list, buffers[slot], D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            ID3D12GraphicsCommandList_CopyBufferRegion(list, observations, slot * 256, buffers[slot], 0, 256);
+        }
+        transition_resource_state(list, observations, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        get_buffer_readback_with_command_list(observations, DXGI_FORMAT_UNKNOWN, &rb, context.queue, list);
+        for (slot = 0; slot < 2; ++slot)
+        {
+            value = get_readback_uint(&rb, 129 + slot * 2, 0, 0);
+            expected = mode == 4 && !slot ? 124 : total[slot] * strides[slot];
+            ok(value == expected, "Slot %u final counter %"PRIu64", expected %"PRIu64".\n", slot, value, expected);
+            value = get_readback_uint(&rb, 133 + slot * 2, 0, 0);
+            expected = mode == 4 && !slot ? 124 : (initial[slot] + blocked[slot]) * strides[slot];
+            ok(value == expected, "Slot %u limited counter %"PRIu64", expected %"PRIu64".\n", slot, value, expected);
+            ok(get_readback_uint(&rb, 128 + slot * 2, 0, 0) == 0xcdcdcdcd &&
+                    get_readback_uint(&rb, 132 + slot * 2, 0, 0) == 0xcdcdcdcd,
+                    "Slot %u counter guard was overwritten.\n", slot);
+            for (word = 0; word < 64; ++word)
+            {
+                vertex = word / (strides[slot] / 4);
+                component = word % (strides[slot] / 4);
+                if (vertex >= total[slot] || component >= (slot ? multi ? 2 : 4 : 1))
+                {
+                    ok(get_readback_uint(&rb, slot * 64 + word, 0, 0) == 0xcdcdcdcd,
+                            "Slot %u padding/tail word %u overwritten.\n", slot, word);
+                    continue;
+                }
+                sequence = vertex < initial[slot] ? vertex : vertex < initial[slot] + blocked[slot] ?
+                        vertex - initial[slot] : vertex - initial[slot] - blocked[slot];
+                floats = (const float *)&positions[sequence];
+                expected_float = multi ? slot ? 4.0f + component : 1.0f :
+                        slot ? floats[component] : sequence == 1 ? 2.0f : 0.0f;
+                ok(get_readback_float(&rb, slot * 64 + word, 0) == expected_float,
+                        "Slot %u data word %u got %g, expected %g.\n", slot, word,
+                        get_readback_float(&rb, slot * 64 + word, 0), expected_float);
+            }
+        }
+        for (slot = 0; slot <= multi; ++slot)
+        {
+            unsigned int written = mode == 4 ? blocked[1] : blocked[slot];
+            unsigned int needed = mode == 4 ? resumed[1] : resumed[slot];
+            value = get_readback_uint64(&rb, 68 + slot * 2, 0);
+            ok(value == written, "Stream %u limited written %"PRIu64", expected %u.\n", slot, value, written);
+            value = get_readback_uint64(&rb, 69 + slot * 2, 0);
+            ok(value == needed, "Stream %u limited needed %"PRIu64", expected %u.\n", slot, value, needed);
+            value = get_readback_uint64(&rb, 72 + slot * 2, 0);
+            ok(value == needed, "Stream %u resumed written %"PRIu64", expected %u.\n", slot, value, needed);
+            value = get_readback_uint64(&rb, 73 + slot * 2, 0);
+            ok(value == needed, "Stream %u resumed needed %"PRIu64", expected %u.\n", slot, value, needed);
+        }
+        release_resource_readback(&rb);
+        reset_command_list(list, context.allocator);
+        ID3D12QueryHeap_Release(queries);
+        ID3D12Resource_Release(observations);
+        ID3D12Resource_Release(counters);
+        ID3D12Heap_Release(counter_heap);
+        ID3D12Resource_Release(buffers[0]);
+        ID3D12Resource_Release(buffers[1]);
+        ID3D12Resource_Release(upload);
+        ID3D12Resource_Release(vertices);
+        ID3D12PipelineState_Release(pso);
+    }
+    vkd3d_test_set_context(NULL);
+    destroy_test_context(&context);
+}
+
+void test_null_stream_output_targets_dxbc(void)
+{
+    test_null_stream_output_targets(false);
+}
+
+void test_null_stream_output_targets_dxil(void)
+{
+    test_null_stream_output_targets(true);
 }

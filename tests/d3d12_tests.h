@@ -18,6 +18,10 @@
  */
 
 /* Can be included multiple times. */
+decl_test(test_tir_one_sample_dxbc);
+decl_test(test_tir_one_sample_dxil);
+decl_test(test_tir_mixed_samples_dxbc);
+decl_test(test_tir_mixed_samples_dxil);
 
 /* These tests check for loading of d3d12core.dll,
  * so they need to be run at the very beginning. */
@@ -45,6 +49,8 @@ decl_test(test_create_placed_resource_size);
 decl_test(test_create_reserved_resource);
 decl_test(test_create_descriptor_heap);
 decl_test(test_create_sampler);
+decl_test(test_filter_reduction_dxbc);
+decl_test(test_filter_reduction_dxil);
 decl_test(test_create_sampler2);
 decl_test(test_create_unordered_access_view);
 decl_test(test_create_root_signature);
@@ -159,6 +165,11 @@ decl_test(test_create_query_heap);
 decl_test(test_query_timestamp);
 decl_test(test_query_timestamp_write_after_read);
 decl_test(test_query_pipeline_statistics);
+decl_test(test_query_pipeline_statistics_continuation);
+decl_test(test_query_pipeline_statistics_continuation_ia);
+decl_test(test_query_dgc_compute_dxbc);
+decl_test(test_query_dgc_compute_dxil);
+decl_test(test_query_pipeline_statistics_multiview);
 decl_test(test_query_occlusion);
 decl_test(test_resolve_non_issued_query_data);
 decl_test(test_resolve_query_data_in_different_command_list);
@@ -228,6 +239,7 @@ decl_test(test_resource_allocation_info);
 decl_test(test_suballocate_small_textures);
 decl_test(test_suballocate_small_textures_size);
 decl_test(test_command_list_initial_pipeline_state);
+decl_test(test_execute_indirect_gpu_produced_roots);
 decl_test(test_blend_factor);
 decl_test(test_dual_source_blending_dxbc);
 decl_test(test_dual_source_blending_dxil);
@@ -249,6 +261,15 @@ decl_test(test_primitive_restart);
 decl_test(test_index_buffer_edge_case_stream_output);
 decl_test(test_vertex_shader_stream_output_dxbc);
 decl_test(test_vertex_shader_stream_output_dxil);
+decl_test(test_vertex_shader_stream_output_partial_dxil);
+decl_test(test_vertex_shader_stream_output_partial_dxbc);
+decl_test(test_vertex_shader_stream_output_partial_user_dxil);
+decl_test(test_vertex_shader_stream_output_partial_user_dxbc);
+decl_test(test_vertex_shader_stream_output_partial_physical_dxil);
+decl_test(test_vertex_shader_stream_output_marker_semantic_dxil);
+decl_test(test_vertex_shader_stream_output_marker_semantic_stream_dxil);
+decl_test(test_null_stream_output_targets_dxbc);
+decl_test(test_null_stream_output_targets_dxil);
 decl_test(test_primitive_restart_list_topology_stream_output);
 decl_test(test_read_write_subresource);
 decl_test(test_queue_wait);
@@ -280,12 +301,22 @@ decl_test(test_bindless_heap_sm66_uav_counter);
 decl_test(test_stencil_export_dxbc);
 decl_test(test_stencil_export_dxil);
 decl_test(test_raytracing);
+decl_test(test_raytracing_serialization);
+decl_test(test_raytracing_serialization_large);
+decl_test(test_raytracing_serialization_rejection);
+decl_test(test_raytracing_recording_rejection);
 decl_test(test_get_resource_tiling);
 decl_test(test_update_tile_mappings);
 decl_test(test_update_tile_mappings_remap_vmem);
 decl_test(test_update_tile_mappings_remap_smem);
 decl_test(test_sampler_border_color);
 decl_test(test_copy_tiles);
+decl_test(test_copy_tiles_byte_offsets);
+decl_test(test_copy_tiles_predicated);
+decl_test(test_copy_tiles_predicated_buffer_queries);
+decl_test(test_copy_tiles_msaa);
+decl_test(test_copy_tiles_msaa_array);
+decl_test(test_reserved_compat_mappings);
 decl_test(test_buffer_feedback_instructions_sm51);
 decl_test(test_buffer_feedback_instructions_dxil);
 decl_test(test_texture_feedback_instructions_sm51);
@@ -384,6 +415,7 @@ decl_test(test_raytracing_default_association_tiebreak);
 decl_test(test_raytracing_collection_identifiers);
 decl_test(test_raytracing_root_signature_from_subobject);
 decl_test(test_raytracing_deferred_compilation);
+decl_test(test_raytracing_deferred_collection_exports);
 decl_test(test_raytracing_mismatch_global_rs_link);
 decl_test(test_raytracing_null_rtas);
 decl_test(test_raytracing_opacity_micro_map);
@@ -522,6 +554,7 @@ decl_test(test_null_descriptor_resinfo_dxil);
 decl_test(test_root_signature_embedded);
 decl_test(test_tight_resource_alignment);
 decl_test(test_raytracing_acceleration_structure_validation);
+decl_test(test_raytracing_postbuild_recording_failure);
 decl_test(test_placed_msaa_alignment_workaround);
 decl_test(test_placed_msaa_alignments);
 decl_test(test_custom_border_color_limits);
@@ -579,3 +612,11 @@ decl_test(test_query_heap_cpu_resolve_timestamp);
 decl_test(test_query_heap_cpu_resolve_occlusion);
 decl_test(test_buffer_descriptor_byte_offset);
 decl_test(test_raytracing_collection_handle_invariance);
+
+decl_test(test_tir_outputs_dxbc);
+
+decl_test(test_tir_outputs_dxil);
+
+decl_test(test_tir_invalid_dxbc);
+
+decl_test(test_tir_invalid_dxil);

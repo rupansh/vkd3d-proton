@@ -1,0 +1,17 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tiled_copy.h"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform writeonly uimage2DMSArray dst;
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, args.extent)) || !enabled())
+        return;
+    uint sample_index = gl_GlobalInvocationID.z;
+    uint offset = ((p.y * args.tile_width + p.x) * args.samples + sample_index) * args.bytes_per_sample;
+    uvec4 value = uvec4(0);
+    for (uint i = 0; i < (args.bytes_per_sample + 3) / 4; ++i)
+        value[i] = load_bytes(offset + 4 * i, min(4u, args.bytes_per_sample));
+    imageStore(dst, ivec3(p + args.origin, args.layer), int(sample_index), value);
+}

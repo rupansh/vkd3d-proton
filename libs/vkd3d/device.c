@@ -108,9 +108,12 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(EXT_CONSERVATIVE_RASTERIZATION, EXT_conservative_rasterization),
     VK_EXTENSION(EXT_CUSTOM_BORDER_COLOR, EXT_custom_border_color),
     VK_EXTENSION(EXT_DEPTH_CLIP_ENABLE, EXT_depth_clip_enable),
+    VK_EXTENSION(EXT_DEPTH_RANGE_UNRESTRICTED, EXT_depth_range_unrestricted),
+    VK_EXTENSION(EXT_DEPTH_CLAMP_ZERO_ONE, EXT_depth_clamp_zero_one),
     VK_EXTENSION(EXT_DEVICE_GENERATED_COMMANDS, EXT_device_generated_commands),
     VK_EXTENSION(EXT_IMAGE_VIEW_MIN_LOD, EXT_image_view_min_lod),
     VK_EXTENSION(EXT_ROBUSTNESS_2, EXT_robustness2),
+    VK_EXTENSION(EXT_SAMPLE_LOCATIONS, EXT_sample_locations),
     VK_EXTENSION(EXT_SHADER_STENCIL_EXPORT, EXT_shader_stencil_export),
     VK_EXTENSION(EXT_TRANSFORM_FEEDBACK, EXT_transform_feedback),
     VK_EXTENSION(EXT_VERTEX_ATTRIBUTE_DIVISOR, EXT_vertex_attribute_divisor),
@@ -147,6 +150,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(AMD_ANTI_LAG, AMD_anti_lag),
     VK_EXTENSION(AMD_SHADER_EXPLICIT_VERTEX_PARAMETER, AMD_shader_explicit_vertex_parameter),
     /* NV extensions */
+    VK_EXTENSION(NV_FRAMEBUFFER_MIXED_SAMPLES, NV_framebuffer_mixed_samples),
     VK_EXTENSION(NV_OPTICAL_FLOW, NV_optical_flow),
     VK_EXTENSION(NV_SHADER_SM_BUILTINS, NV_shader_sm_builtins),
     VK_EXTENSION_DISABLE_COND(NVX_BINARY_IMPORT, NVX_binary_import, VKD3D_CONFIG_FLAG_STATIC(NO_NVX)),
@@ -2121,6 +2125,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         vk_prepend_struct(&info->properties2, &info->custom_border_color_properties);
     }
 
+    if (vulkan_info->EXT_depth_clamp_zero_one)
+    {
+        info->depth_clamp_zero_one_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_EXT;
+        vk_prepend_struct(&info->features2, &info->depth_clamp_zero_one_features);
+    }
+
     if (vulkan_info->EXT_depth_clip_enable)
     {
         info->depth_clip_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT;
@@ -2297,6 +2307,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
     {
         info->present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
         vk_prepend_struct(&info->features2, &info->present_wait_features);
+    }
+
+    if (vulkan_info->EXT_sample_locations)
+    {
+        info->sample_locations_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT;
+        vk_prepend_struct(&info->properties2, &info->sample_locations_properties);
     }
 
     if (vulkan_info->KHR_maintenance5)
@@ -3282,6 +3298,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
 
     if (!physical_device_info->conditional_rendering_features.conditionalRendering)
         vulkan_info->EXT_conditional_rendering = false;
+    if (!physical_device_info->depth_clamp_zero_one_features.depthClampZeroOne)
+        vulkan_info->EXT_depth_clamp_zero_one = false;
     if (!physical_device_info->depth_clip_features.depthClipEnable)
         vulkan_info->EXT_depth_clip_enable = false;
 
@@ -4825,6 +4843,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     size_t i, j;
 
+
     d3d_destruction_notifier_free(&device->destruction_notifier);
 
     if (device->internal_sparse_queue)
@@ -5091,7 +5110,7 @@ static HRESULT d3d12_device_check_multisample_quality_levels(struct d3d12_device
     if (!data->SampleCount)
         return E_FAIL;
 
-    if (data->SampleCount == 1)
+    if (data->SampleCount == 1 && !(data->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE))
     {
         data->NumQualityLevels = 1;
         goto done;
@@ -5117,6 +5136,19 @@ static HRESULT d3d12_device_check_multisample_quality_levels(struct d3d12_device
     sample_counts = (data->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
             ? format->supported_sparse_sample_counts
             : format->supported_sample_counts;
+
+    if (data->Flags & D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE)
+    {
+        /* Keep logical reserved-image queries coherent with creation. The
+         * isolated compatibility path explicitly does not provide aliases. */
+        sample_counts |= vkd3d_reserved_compat_sample_counts(format);
+        sample_counts &= VK_SAMPLE_COUNT_1_BIT | (format->byte_count <= 8 ? VK_SAMPLE_COUNT_4_BIT : 0);
+        if (!(vkd3d_reserved_compat_sample_counts(format) & VK_SAMPLE_COUNT_1_BIT))
+            sample_counts = 0;
+        if (format->vk_format == VK_FORMAT_D32_SFLOAT &&
+                (!device->device_info.maintenance_8_features.maintenance8 || !device->vk_info.EXT_depth_range_unrestricted))
+            sample_counts &= ~VK_SAMPLE_COUNT_4_BIT;
+    }
 
     if (sample_counts & vk_samples)
         data->NumQualityLevels = 1;
@@ -5382,7 +5414,7 @@ static HRESULT d3d12_device_get_format_support(struct d3d12_device *device, D3D1
             vr = VK_CALL(vkGetPhysicalDeviceImageFormatProperties2(
               device->vk_physical_device, &format_info, &format_properties));
 
-            if (vr == VK_SUCCESS)
+            if (vr == VK_SUCCESS || (vkd3d_reserved_compat_sample_counts(format) & VK_SAMPLE_COUNT_1_BIT))
                 data->Support2 |= D3D12_FORMAT_SUPPORT2_TILED;
         }
 
@@ -8399,8 +8431,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_SetResidencyPriority(d3d12_device_
     return S_OK;
 }
 
-static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineState(d3d12_device_iface *iface,
-        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state)
+static HRESULT d3d12_device_create_pipeline_state(d3d12_device_iface *iface,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state,
+        bool helios_so_registers)
 {
     struct d3d12_device *device = impl_from_ID3D12Device(iface);
     struct d3d12_pipeline_state_desc pipeline_desc;
@@ -8414,11 +8447,45 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineState(d3d12_device_i
     if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&pipeline_desc, desc, &pipeline_type)))
         return hr;
 
+    if (helios_so_registers)
+    {
+        if (pipeline_type != VK_PIPELINE_BIND_POINT_GRAPHICS || !pipeline_desc.stream_output.NumEntries)
+        {
+            WARN("Native stream-output pipeline requires a graphics SO declaration.\n");
+            return E_INVALIDARG;
+        }
+        pipeline_desc.helios_so_registers = true;
+    }
+
     if (FAILED(hr = d3d12_pipeline_state_create(device, pipeline_type, &pipeline_desc, &object)))
         return hr;
 
     return return_interface(&object->ID3D12PipelineState_iface,
             &IID_ID3D12PipelineState, riid, pipeline_state);
+}
+
+static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineState(d3d12_device_iface *iface,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state)
+{
+    return d3d12_device_create_pipeline_state(iface, desc, riid, pipeline_state, false);
+}
+
+/* The native bridge links this C symbol statically. Linux exposes it only for
+ * the engine's private-contract test; public D3D12 entry points never set the
+ * origin bit. No second engine instance or device-global mode is involved. */
+#ifndef _WIN32
+__attribute__((visibility("default")))
+#endif
+HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device *iface,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, ID3D12PipelineState **pipeline_state)
+{
+    if (!pipeline_state)
+        return E_INVALIDARG;
+    *pipeline_state = NULL;
+    if (!iface || !desc)
+        return E_INVALIDARG;
+    return d3d12_device_create_pipeline_state((d3d12_device_iface *)iface, desc,
+            &IID_ID3D12PipelineState, (void **)pipeline_state, true);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
@@ -8930,13 +8997,85 @@ cleanup:
 static D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE d3d12_device_CheckDriverMatchingIdentifier(d3d12_device_iface *iface,
         D3D12_SERIALIZED_DATA_TYPE serialized_data_type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *identifier)
 {
-    FIXME("iface %p, serialized_data_type %u, identifier %p stub!\n",
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    const struct vkd3d_vk_instance_procs *instance_procs = &device->vkd3d_instance->vk_procs;
+    VkAccelerationStructureCompatibilityKHR compatibility;
+    VkAccelerationStructureVersionInfoKHR version_info;
+    VkPhysicalDeviceLayeredApiVulkanPropertiesKHR layered_vulkan;
+    VkPhysicalDeviceLayeredApiPropertiesListKHR layered_list;
+    VkPhysicalDeviceLayeredApiPropertiesKHR layered_api;
+    VkPhysicalDeviceIDProperties layered_id;
+    VkPhysicalDeviceProperties2 properties;
+    const uint8_t *driver_uuid;
+
+    TRACE("iface %p, serialized_data_type %u, identifier %p.\n",
             iface, serialized_data_type, identifier);
 
-    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE)
+    if (serialized_data_type != D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE ||
+            !d3d12_device_supports_ray_tracing_tier_1_0(device))
         return D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE;
 
-    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+    if (!identifier || !vk_procs->vkGetDeviceAccelerationStructureCompatibilityKHR)
+        return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+
+    /* The Vulkan serialization header starts with driverUUID, then 16 bytes of
+     * opaque compatibility data. DXR's DriverOpaqueGUID/versioning data have
+     * that exact byte layout. Preserve bytes; a GUID string conversion would
+     * change byte order and break compatibility. A different driverUUID is an
+     * unrecognized producer, distinct from this driver's incompatible version.
+     * Vulkan acceleration-structure serialization and DXR functional specs. */
+    driver_uuid = (device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_VENUS ||
+            device->device_info.layer_driver_id == VK_DRIVER_ID_MESA_VENUS) ?
+            NULL : device->device_info.vulkan_1_1_properties.driverUUID;
+    if (device->vk_info.KHR_maintenance7)
+    {
+        /* Venus synthesizes its public driverUUID, while serialization comes
+         * from the underlying Vulkan driver. Its maintenance7 layered query
+         * preserves that producer's actual ID properties. Device initialization
+         * has already replaced the cached driverID with the underlying driver's
+         * ID, so that cached ID cannot identify a layered implementation here.
+         * Query only the advertised extension and preserve its producer UUID. */
+        memset(&layered_id, 0, sizeof(layered_id));
+        layered_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        memset(&layered_vulkan, 0, sizeof(layered_vulkan));
+        layered_vulkan.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR;
+        layered_vulkan.properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        layered_vulkan.properties.pNext = &layered_id;
+        memset(&layered_api, 0, sizeof(layered_api));
+        layered_api.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_KHR;
+        layered_api.pNext = &layered_vulkan;
+        memset(&layered_list, 0, sizeof(layered_list));
+        layered_list.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_LIST_KHR;
+        layered_list.layeredApiCount = 1;
+        layered_list.pLayeredApis = &layered_api;
+        memset(&properties, 0, sizeof(properties));
+        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties.pNext = &layered_list;
+        instance_procs->vkGetPhysicalDeviceProperties2(device->vk_physical_device, &properties);
+        if (layered_list.layeredApiCount)
+            driver_uuid = layered_api.layeredAPI == VK_PHYSICAL_DEVICE_LAYERED_API_VULKAN_KHR &&
+                    memcmp(layered_id.driverUUID, (uint8_t[VK_UUID_SIZE]){0}, VK_UUID_SIZE) ?
+                    layered_id.driverUUID : NULL;
+    }
+
+    /* Older Venus versions without maintenance7 can still accept a compatible
+     * blob, but supply no producer UUID evidence to distinguish a foreign
+     * identifier from this driver's incompatible serialization version. */
+
+    if (driver_uuid && memcmp(&identifier->DriverOpaqueGUID, driver_uuid, VK_UUID_SIZE))
+        return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+
+    memset(&version_info, 0, sizeof(version_info));
+    version_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_VERSION_INFO_KHR;
+    version_info.pVersionData = (const uint8_t *)identifier;
+    VK_CALL(vkGetDeviceAccelerationStructureCompatibilityKHR(device->vk_device,
+            &version_info, &compatibility));
+
+    if (compatibility == VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR)
+        return D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE;
+    return driver_uuid ? D3D12_DRIVER_MATCHING_IDENTIFIER_INCOMPATIBLE_VERSION :
+            D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_SetBackgroundProcessingMode(d3d12_device_iface *iface,
@@ -10462,8 +10601,10 @@ static void d3d12_device_caps_init_feature_options19(struct d3d12_device *device
     /* We trivially support this by not validating resource types in rendering
      * and computing renderArea to be the intersection of all bound views. */
     options19->MismatchingOutputDimensionsSupported = TRUE;
-    /* Requires SampleCount > 1 for pipelinesm, not just ForcedSamplecount */
-    options19->SupportedSampleCountsWithNoOutputs = 0x1;
+    /* With no attachments, command-list state retains the PSO sample count.
+     * Vulkan and this D3D12 mask both encode counts as power-of-two bits. */
+    options19->SupportedSampleCountsWithNoOutputs =
+            device->device_info.properties2.properties.limits.framebufferNoAttachmentsSampleCounts & 0x1f;
     /* D3D12 expectations w.r.t. rounding match Vulkan spec.
      * However, both AMD and Intel native drivers round to even. RADV has no-trunc-coord workarounds.
      * Turnip enables round-to-even behavior for vkd3d. Same for ANV. */
@@ -11300,6 +11441,61 @@ static bool d3d12_device_supports_feature_level(struct d3d12_device *device, D3D
     return feature_level <= device->d3d12_caps.max_feature_level;
 }
 
+/* Static native UMD admission, separate from the ordinary engine entry point.
+ * The caller holds the returned device until this check succeeds or fails. */
+HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t minimum_feature_level)
+{
+    struct d3d12_device *device;
+    const struct d3d12_caps *caps;
+    char override[VKD3D_PATH_MAX];
+
+    if (!iface || (minimum_feature_level != D3D_FEATURE_LEVEL_11_0 && minimum_feature_level != D3D_FEATURE_LEVEL_12_1))
+        return E_INVALIDARG;
+    /* The engine's developer overrides modify the derived caps. They cannot
+     * supply evidence for a native driver contract, even when set lower. */
+    if ((vkd3d_get_env_var("VKD3D_FEATURE_LEVEL", override, sizeof(override)) && override[0]) ||
+            (vkd3d_get_env_var("VKD3D_SHADER_MODEL", override, sizeof(override)) && override[0]))
+    {
+        ERR("Native feature admission refuses VKD3D_FEATURE_LEVEL / VKD3D_SHADER_MODEL overrides.\n");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
+    caps = &device->d3d12_caps;
+    if (!d3d12_device_supports_feature_level(device, minimum_feature_level) || caps->max_shader_model < D3D_SHADER_MODEL_6_0)
+    {
+        ERR("Native feature admission failed: engine FL %#x SM %#x, required FL %#x SM 6.0.\n",
+                caps->max_feature_level, caps->max_shader_model, minimum_feature_level);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
+            !device->device_info.device_generated_commands_features.deviceGeneratedCommands)
+    {
+        ERR("Native FL12 admission requires VK_EXT_device_generated_commands; no private emulation is installed.\n");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
+            (caps->options.ResourceBindingTier < D3D12_RESOURCE_BINDING_TIER_3 ||
+             caps->options.ConservativeRasterizationTier < D3D12_CONSERVATIVE_RASTERIZATION_TIER_3 ||
+             (caps->options19.SupportedSampleCountsWithNoOutputs & 0x1f) != 0x1f ||
+             !device->device_info.maintenance_8_features.maintenance8 || !device->vk_info.EXT_depth_range_unrestricted ||
+             !device->device_info.vulkan_1_2_features.storageBuffer8BitAccess || !device->device_info.vulkan_1_2_features.shaderInt8 ||
+             !device->device_info.features2.features.shaderStorageImageMultisample ||
+             !device->device_info.features2.features.shaderStorageImageWriteWithoutFormat))
+    {
+        ERR("Native FL12_1 backing unavailable: binding %u conservative %u no_output_samples %#x maintenance8 %u depth_range %u "
+                "storage8 %u int8 %u image_msaa %u image_write_without_format %u.\n",
+                caps->options.ResourceBindingTier, caps->options.ConservativeRasterizationTier,
+                caps->options19.SupportedSampleCountsWithNoOutputs,
+                device->device_info.maintenance_8_features.maintenance8, device->vk_info.EXT_depth_range_unrestricted,
+                device->device_info.vulkan_1_2_features.storageBuffer8BitAccess, device->device_info.vulkan_1_2_features.shaderInt8,
+                device->device_info.features2.features.shaderStorageImageMultisample,
+                device->device_info.features2.features.shaderStorageImageWriteWithoutFormat);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    INFO("Native feature admission: FL %#x with implemented tiled copy and compatibility backing.\n", minimum_feature_level);
+    return S_OK;
+}
+
 static void d3d12_device_replace_vtable(struct d3d12_device *device)
 {
     /* Don't bother replacing the vtable unless we have to. */
@@ -11516,6 +11712,9 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
 
     if (FAILED(hr = vkd3d_create_vk_device(device, create_info)))
         goto out_free_fragment_output_lock;
+
+    /* Read once per device. No GPU probing or per-frame I/O on application queues. */
+    vkd3d_reserved_compat_init(device);
 
     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
         goto out_free_vk_resources;

@@ -92,7 +92,7 @@ enum vkd3d_shader_meta_flags
 struct vkd3d_shader_meta
 {
     vkd3d_shader_hash_t hash;
-    unsigned int cs_workgroup_size[3]; /* Only contains valid data if uses_subgroup_size is true. */
+    unsigned int cs_workgroup_size[3]; /* Compute dimensions, populated by both DXBC and DXIL compilation. */
     unsigned int patch_vertex_count; /* Relevant for HS. May be 0, in which case the patch vertex count is not known. */
     uint8_t cs_wave_size_min; /* If non-zero, minimum or required subgroup size. */
     uint8_t cs_wave_size_max; /* If non-zero, maximum subgroup size. */
@@ -391,6 +391,8 @@ struct vkd3d_shader_transform_feedback_info
     unsigned int element_count;
     const unsigned int *buffer_strides;
     unsigned int buffer_stride_count;
+    /* Internal origin supplied by the native-DDI PSO factory. */
+    bool helios_so_registers;
 };
 
 enum vkd3d_shader_target
@@ -609,7 +611,14 @@ struct vkd3d_shader_compile_arguments
     unsigned int parameter_count;
     const struct vkd3d_shader_parameter *parameters;
 
+    /* Concrete Vulkan interface limits for stream-output capture variables. */
+    unsigned int max_output_components;
+    unsigned int max_total_output_components;
     bool dual_source_blending;
+    /* Coincident Vulkan output samples represent one D3D raster sample. */
+    bool emulate_forced_sample_count_one;
+    bool tir_single_sample_output;
+    bool tir_alpha_to_coverage;
     const unsigned int *output_swizzles;
     unsigned int output_swizzle_count;
 

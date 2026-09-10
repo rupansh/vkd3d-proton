@@ -30,6 +30,7 @@
 #include "rbtree.h"
 
 #include "vkd3d.h"
+#include "vkd3d_reserved_compat.h"
 #include "vkd3d_build.h"
 #include "vkd3d_version.h"
 #include "vkd3d_shader.h"
@@ -48,6 +49,8 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
+
+#include "helios_root_signature.h"
 
 #define VK_CALL(f) (vk_procs->f)
 
@@ -165,9 +168,12 @@ struct vkd3d_vulkan_info
     bool EXT_conservative_rasterization;
     bool EXT_custom_border_color;
     bool EXT_depth_clip_enable;
+    bool EXT_depth_range_unrestricted;
+    bool EXT_depth_clamp_zero_one;
     bool EXT_device_generated_commands;
     bool EXT_image_view_min_lod;
     bool EXT_robustness2;
+    bool EXT_sample_locations;
     bool EXT_shader_stencil_export;
     bool EXT_transform_feedback;
     bool EXT_vertex_attribute_divisor;
@@ -205,6 +211,7 @@ struct vkd3d_vulkan_info
     bool AMD_anti_lag;
     bool AMD_shader_explicit_vertex_parameter;
     /* NV device extensions */
+    bool NV_framebuffer_mixed_samples;
     bool NV_optical_flow;
     bool NV_shader_sm_builtins;
     bool NVX_binary_import;
@@ -1082,7 +1089,9 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
+    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
+    /* Logical tiled image with committed backing. Never pass it to BindSparse. */
+    VKD3D_RESOURCE_RESERVED_COMPAT        = (1u << 12)
 };
 
 /* Helios: a PRIVATE D3D12_HEAP_FLAGS bit, set by helios_umd12.dll on a committed
@@ -1143,6 +1152,8 @@ struct d3d12_sparse_tile
     };
     VkDeviceMemory vk_memory;
     VkDeviceSize vk_offset;
+    /* Native Helios mappings own their physical heap until unbinding retires. */
+    struct d3d12_heap *helios_heap;
 };
 
 struct d3d12_sparse_info
@@ -1243,6 +1254,16 @@ static inline bool d3d12_resource_is_buffer(const struct d3d12_resource *resourc
 {
     return resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
 }
+
+static inline bool d3d12_resource_is_tiled(const struct d3d12_resource *resource)
+{
+    return !!(resource->flags & (VKD3D_RESOURCE_RESERVED | VKD3D_RESOURCE_RESERVED_COMPAT));
+}
+
+void vkd3d_reserved_compat_init(struct d3d12_device *device);
+VkSampleCountFlags vkd3d_reserved_compat_sample_counts(const struct vkd3d_format *format);
+HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t minimum_feature_level);
+void vkd3d_reserved_compat_note_mapping(struct d3d12_resource *resource, bool copy);
 
 static inline bool d3d12_resource_is_acceleration_structure(const struct d3d12_resource *resource)
 {
@@ -1915,6 +1936,8 @@ struct d3d12_query_heap
     struct vkd3d_cookie cookie;
     uint32_t initialized;
     D3D12_QUERY_HEAP_FLAGS flags;
+    /* Immutable: internal preprocessing must not enter application statistics. */
+    bool inline_queries;
 
     struct d3d12_device *device;
     void *host_mapped;
@@ -2032,6 +2055,9 @@ struct d3d12_root_signature
     LONG refcount;
     LONG internal_refcount;
 
+    bool helios_driver_root;
+    bool raw_va_root_descriptors;
+
     /* Compatibility for exact match. For PSO blob validation. */
     vkd3d_shader_hash_t pso_compatibility_hash;
     /* Compatiblity for ABI in RTPSOs. Match if the VkPipelineLayouts are equivalent. */
@@ -2046,17 +2072,18 @@ struct d3d12_root_signature
 
     struct vkd3d_shader_root_parameter *parameters;
     unsigned int parameter_count;
+    unsigned int root_cost;
 
     uint32_t sampler_descriptor_set;
     uint32_t root_descriptor_set;
 
-    uint64_t descriptor_table_mask;
+    vkd3d_root_mask_t descriptor_table_mask;
 #ifdef VKD3D_ENABLE_BREADCRUMBS
-    uint64_t descriptor_table_mask_sampler;
+    vkd3d_root_mask_t descriptor_table_mask_sampler;
 #endif
-    uint64_t root_constant_mask;
-    uint64_t root_descriptor_raw_va_mask;
-    uint64_t root_descriptor_push_mask;
+    vkd3d_root_mask_t root_constant_mask;
+    vkd3d_root_mask_t root_descriptor_raw_va_mask;
+    vkd3d_root_mask_t root_descriptor_push_mask;
 
     D3D12_ROOT_SIGNATURE_FLAGS d3d12_flags;
 
@@ -2112,6 +2139,10 @@ struct d3d12_root_signature
 
 HRESULT d3d12_root_signature_create(struct d3d12_device *device, const void *bytecode,
         size_t bytecode_length, struct d3d12_root_signature **root_signature);
+
+HRESULT helios_vkd3d_create_root_signature(ID3D12Device *device, UINT node_mask,
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc, ID3D12RootSignature **root_signature);
+HRESULT helios_vkd3d_clear_root_arguments(ID3D12GraphicsCommandList *list);
 HRESULT d3d12_root_signature_create_from_subobject(struct d3d12_device *device, const void *bytecode,
         size_t bytecode_length, LPCWSTR subobject, struct d3d12_root_signature **root_signature);
 HRESULT d3d12_root_signature_create_raw(struct d3d12_device *device, const void *payload,
@@ -2273,9 +2304,14 @@ struct vkd3d_fragment_output_pipeline_desc
 
     VkSampleMask ms_sample_mask;
     VkPipelineMultisampleStateCreateInfo ms_info;
+    /* Pointers stay NULL in the cache key and are fixed up in prepare(). */
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_info;
+    VkSampleLocationEXT sample_locations[32];
 
     VkFormat rt_formats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
     VkPipelineRenderingCreateInfo rt_info;
+    VkAttachmentSampleCountInfoNV attachment_samples_info;
+    VkSampleCountFlagBits attachment_samples[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
 
     VkDynamicState dy_states[VKD3D_MAX_FRAGMENT_OUTPUT_DYNAMIC_STATES];
     VkPipelineDynamicStateCreateInfo dy_info;
@@ -2367,6 +2403,12 @@ struct d3d12_graphics_pipeline_state
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE index_buffer_strip_cut_value;
     VkPipelineRasterizationStateCreateInfo rs_desc;
     VkPipelineMultisampleStateCreateInfo ms_desc;
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_info;
+    VkSampleLocationEXT sample_locations[32];
+    unsigned int forced_sample_count;
+    uint32_t tir_query_divisor;
+    bool tir_single_sample_output;
+    bool tir_alpha_to_coverage;
     VkPipelineDepthStencilStateCreateInfo ds_desc;
     VkPipelineColorBlendStateCreateInfo blend_desc;
 
@@ -2431,6 +2473,7 @@ struct d3d12_pipeline_state
     ID3D12PipelineState ID3D12PipelineState_iface;
     LONG refcount;
     LONG internal_refcount;
+
 
     union
     {
@@ -2520,7 +2563,12 @@ struct d3d12_pipeline_state_desc
     UINT node_mask;
     struct d3d12_cached_pipeline_state cached_pso;
     D3D12_PIPELINE_STATE_FLAGS flags;
+    /* Set only by the private native-DDI pipeline factory, never semantic text. */
+    bool helios_so_registers;
 };
+
+HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device *device,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, ID3D12PipelineState **pipeline_state);
 
 HRESULT vkd3d_pipeline_state_desc_from_d3d12_graphics_desc(struct d3d12_pipeline_state_desc *desc,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d3d12_desc);
@@ -2807,12 +2855,18 @@ struct d3d12_command_allocator
     size_t pipelines_size;
     size_t pipelines_count;
 
+
+    /* Per-recording raw multisample depth staging survives list Reset/replay
+     * and retires with the allocator's submitted command buffers. */
+    struct vkd3d_tiled_copy_scratch_image *tiled_copy_images;
+
     struct d3d12_descriptor_heap **descriptor_heaps;
     size_t descriptor_heaps_size;
     size_t descriptor_heaps_count;
 
     struct d3d12_command_allocator_command_pool primary_pool;
     struct d3d12_command_allocator_command_pool fallback_pool;
+    struct d3d12_command_allocator_command_pool graphics_fallback_pool;
     struct d3d12_command_allocator_scratch_pool scratch_pools[VKD3D_SCRATCH_POOL_KIND_COUNT];
 
     VkExtent3D transfer_granularity;
@@ -2844,7 +2898,7 @@ HRESULT d3d12_command_allocator_create(struct d3d12_device *device,
         D3D12_COMMAND_LIST_TYPE type,
         uint32_t vk_family_index,
         struct d3d12_command_allocator **allocator);
-bool d3d12_command_allocator_allocate_query_from_type_index(
+HRESULT d3d12_command_allocator_allocate_query_from_type_index(
         struct d3d12_command_allocator *allocator,
         uint32_t type_index, VkQueryPool *query_pool, uint32_t *query_index);
 uint32_t d3d12_command_allocator_allocate_meta_index(
@@ -2887,16 +2941,16 @@ struct vkd3d_pipeline_bindings
     VkDescriptorSet static_sampler_set;
     uint32_t dirty_flags; /* vkd3d_pipeline_dirty_flags */
 
-    uint32_t descriptor_tables[D3D12_MAX_ROOT_COST];
+    uint32_t descriptor_tables[VKD3D_ROOT_SIGNATURE_MAX_COST];
     uint64_t legacy_descriptor_set_dirty_mask;
 
     /* Needed when VK_KHR_push_descriptor is not available. */
-    struct vkd3d_root_descriptor_info root_descriptors[D3D12_MAX_ROOT_COST];
-    uint64_t root_descriptor_dirty_mask;
-    uint64_t root_descriptor_active_mask;
+    struct vkd3d_root_descriptor_info root_descriptors[VKD3D_ROOT_SIGNATURE_MAX_COST];
+    vkd3d_root_mask_t root_descriptor_dirty_mask;
+    vkd3d_root_mask_t root_descriptor_active_mask;
 
-    uint32_t root_constants[D3D12_MAX_ROOT_COST];
-    uint64_t root_constant_dirty_mask;
+    uint32_t root_constants[VKD3D_ROOT_SIGNATURE_MAX_COST];
+    vkd3d_root_mask_t root_constant_dirty_mask;
 };
 
 struct vkd3d_dynamic_state
@@ -2992,6 +3046,13 @@ struct vkd3d_active_query
     uint32_t vk_index;
     enum vkd3d_active_query_state state;
     uint32_t resolve_index;
+    uint32_t slot_count;
+    /* Normalize each physical TIR fragment before adding logical queries. */
+    uint32_t occlusion_divisor;
+    /* GPU-produced statistics fragments have no Vulkan query pool. The
+     * command allocator owns this scratch backing through GPU retirement. */
+    VkBuffer statistics_buffer;
+    VkDeviceSize statistics_offset;
 };
 
 enum vkd3d_query_range_flag
@@ -3235,12 +3296,26 @@ struct d3d12_command_list_iteration_indirect_meta
     bool need_preprocess_barrier;
 };
 
+enum vkd3d_rtas_metadata_op
+{
+    VKD3D_RTAS_METADATA_DESERIALIZE,
+    VKD3D_RTAS_METADATA_SERIALIZATION_QUERY,
+};
+
+struct vkd3d_rtas_metadata
+{
+    D3D12_GPU_VIRTUAL_ADDRESS src;
+    D3D12_GPU_VIRTUAL_ADDRESS dst;
+    enum vkd3d_rtas_metadata_op op;
+};
+
 struct d3d12_command_list_iteration
 {
     VkCommandBuffer vk_command_buffer;
     VkCommandBuffer vk_post_indirect_barrier_commands;
     uint32_t estimated_cost;
-    bool fallback; /* Only applies to vk_command_buffer. */
+    uint32_t fallback; /* Submission queue tag, only applies to vk_command_buffer. */
+    struct vkd3d_rtas_metadata rtas_metadata; /* Before this stream. */
     struct d3d12_command_list_iteration_indirect_meta indirect_meta;
 };
 
@@ -3251,9 +3326,13 @@ enum
      * without having to add more allocations. */
     VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_DEFAULT = 0,
     VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_FALLBACK_QUEUE = 1u << 0,
+    VKD3D_COMMAND_BUFFER_SUBMIT_INFO_DEVICE_MASK_GRAPHICS_FALLBACK_QUEUE = 1u << 1,
 };
 
-#define VKD3D_MAX_COMMAND_LIST_SEQUENCES 2
+/* At most two optional primary sequences, then mandatory compute and graphics
+ * continuations. A continuation never returns to a less capable queue. */
+#define VKD3D_MAX_PRIMARY_COMMAND_LIST_SEQUENCES 2
+#define VKD3D_MAX_COMMAND_LIST_SEQUENCES (VKD3D_MAX_PRIMARY_COMMAND_LIST_SEQUENCES + 2)
 
 #define VKD3D_COMMAND_COST_LOW              (1u)
 #define VKD3D_COMMAND_COST_HIGH             (16u)
@@ -3290,7 +3369,9 @@ struct d3d12_command_list_sequence
      * Command stream can be split on e.g. INDIRECT_ARGUMENT resource state.
      * This allows us to hoist predication CS streams nicely even in cases
      * where INDIRECT_ARGUMENT barriers appear in the stream. */
-    struct d3d12_command_list_iteration iterations[VKD3D_MAX_COMMAND_LIST_SEQUENCES];
+    struct d3d12_command_list_iteration *iterations;
+    struct d3d12_command_list_iteration inline_iterations[VKD3D_MAX_COMMAND_LIST_SEQUENCES];
+    size_t iterations_size;
     unsigned int iteration_count;
     unsigned int active_non_inline_running_queries;
     bool uses_dgc_compute_in_async_compute;
@@ -3395,6 +3476,8 @@ struct d3d12_command_list
 
     bool is_recording;
     bool is_valid;
+    HRESULT recording_error;
+    HRESULT close_error;
     bool debug_capture;
     bool has_replaced_shaders;
 
@@ -3537,6 +3620,9 @@ struct d3d12_command_list
 
 HRESULT d3d12_command_list_create(struct d3d12_device *device,
         UINT node_mask, D3D12_COMMAND_LIST_TYPE type, struct d3d12_command_list **list);
+/* Every recording refusal, including ones in other translation units, must
+ * latch a failure HRESULT here rather than modifying is_valid directly. */
+void d3d12_command_list_record_error(struct d3d12_command_list *list, HRESULT hr);
 bool d3d12_command_list_reset_query(struct d3d12_command_list *list,
         VkQueryPool vk_pool, uint32_t index);
 void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend);
@@ -3566,8 +3652,8 @@ void d3d12_command_list_meta_push_descriptor_index(struct d3d12_command_list *li
 
 union vkd3d_root_parameter_data
 {
-    uint32_t root_constants[D3D12_MAX_ROOT_COST];
-    VkDeviceAddress root_descriptor_vas[D3D12_MAX_ROOT_COST / 2];
+    uint32_t root_constants[VKD3D_ROOT_SIGNATURE_MAX_COST];
+    VkDeviceAddress root_descriptor_vas[VKD3D_ROOT_SIGNATURE_MAX_COST / 2];
 };
 
 void d3d12_command_list_fetch_root_parameter_data(struct d3d12_command_list *list,
@@ -3745,6 +3831,7 @@ struct vkd3d_sparse_memory_bind
     uint32_t src_tile;
     VkDeviceMemory vk_memory;
     VkDeviceSize vk_offset;
+    struct d3d12_heap *helios_heap;
 };
 
 struct vkd3d_sparse_memory_bind_range
@@ -3753,6 +3840,7 @@ struct vkd3d_sparse_memory_bind_range
     uint32_t tile_count;
     VkDeviceMemory vk_memory;
     VkDeviceSize vk_offset;
+    struct d3d12_heap *helios_heap;
 };
 
 struct d3d12_command_queue_submission_wait
@@ -3773,6 +3861,7 @@ struct d3d12_command_queue_submission_execute
     struct vkd3d_helios_execution *helios_execution;
     VkCommandBufferSubmitInfo *cmd;
     uint32_t *cmd_cost;
+    struct vkd3d_rtas_metadata *rtas_metadata;
     struct d3d12_command_allocator **command_allocators;
     UINT cmd_count;
     UINT num_command_allocators;
@@ -3795,6 +3884,8 @@ struct d3d12_command_queue_submission_execute
 
 struct d3d12_command_queue_submission_bind_sparse
 {
+    struct vkd3d_helios_execution *helios_execution;
+    struct d3d12_heap *helios_heap;
     enum vkd3d_sparse_memory_bind_mode mode;
     uint32_t bind_count;
     struct vkd3d_sparse_memory_bind *bind_infos;
@@ -3941,6 +4032,10 @@ struct d3d12_command_queue
         size_t tracked_size;
         size_t tracked_count;
     } sparse;
+    struct vkd3d_helios_execution *helios_sparse_completion;
+    struct d3d12_heap **helios_sparse_retired_heaps;
+    size_t helios_sparse_retired_count;
+    size_t helios_sparse_retired_size;
 };
 
 HRESULT d3d12_command_queue_create(struct d3d12_device *device,
@@ -3994,6 +4089,7 @@ struct d3d12_command_signature
 
     D3D12_COMMAND_SIGNATURE_DESC desc;
     uint32_t argument_buffer_offset_for_command;
+    uint32_t packed_argument_size;
 
     /* Complex command signatures require some work to stamp out device generated commands. */
     union
@@ -4006,11 +4102,12 @@ struct d3d12_command_signature
             VkIndirectCommandsLayoutEXT layout_implicit;
             VkIndirectCommandsLayoutEXT layout_preprocess;
             uint32_t stride;
+            uint32_t dispatch_offset;
             struct vkd3d_execute_indirect_info pipeline;
         } dgc;
         struct
         {
-            int32_t source_offsets[D3D12_MAX_ROOT_COST];
+            int32_t source_offsets[VKD3D_ROOT_SIGNATURE_MAX_COST];
             uint32_t dispatch_offset_words;
         } compute;
     } state_template;
@@ -4907,6 +5004,7 @@ struct vkd3d_query_gather_args
     VkDeviceAddress src_va;
     VkDeviceAddress map_va;
     uint32_t query_count;
+    uint32_t query_base;
 };
 
 struct vkd3d_query_gather_info
@@ -4915,14 +5013,29 @@ struct vkd3d_query_gather_info
     VkPipeline vk_pipeline;
 };
 
+struct vkd3d_dgc_query_args
+{
+    VkDeviceAddress dst_va;
+    VkDeviceAddress arguments_va;
+    VkDeviceAddress count_va;
+    VkDeviceAddress predicate_va;
+    uint32_t max_count;
+    uint32_t stride;
+    uint32_t group_threads;
+};
+
 struct vkd3d_query_ops
 {
     VkPipelineLayout vk_gather_pipeline_layout;
     VkPipeline vk_gather_occlusion_pipeline;
     VkPipeline vk_gather_so_statistics_pipeline;
+    VkPipeline vk_gather_pipeline_statistics_pipeline;
     VkPipelineLayout vk_resolve_pipeline_layout;
     VkPipeline vk_resolve_binary_pipeline;
+    VkPipelineLayout vk_dgc_pipeline_layout;
+    VkPipeline vk_dgc_pipeline;
 };
+
 
 struct vkd3d_predicate_command_direct_args_execute_indirect
 {
@@ -5167,6 +5280,8 @@ struct vkd3d_workgraph_indirect_ops
     VkPipeline vk_complete_compaction_pipeline;
 };
 
+#include "tiled_copy.h"
+
 struct vkd3d_meta_ops
 {
     struct d3d12_device *device;
@@ -5179,6 +5294,7 @@ struct vkd3d_meta_ops
     struct vkd3d_resolve_image_ops resolve_image_legacy;
     struct vkd3d_swapchain_ops swapchain;
     struct vkd3d_query_ops query;
+    struct vkd3d_tiled_copy_ops tiled_copy;
     struct vkd3d_predicate_ops predicate;
     struct vkd3d_execute_indirect_ops execute_indirect;
     struct vkd3d_multi_dispatch_indirect_ops multi_dispatch_indirect;
@@ -5299,6 +5415,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library_properties;
     VkPhysicalDeviceMemoryDecompressionPropertiesNV memory_decompression_properties;
     VkPhysicalDeviceMaintenance5PropertiesKHR maintenance_5_properties;
+    VkPhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties;
     VkPhysicalDeviceMaintenance6PropertiesKHR maintenance_6_properties;
     VkPhysicalDeviceMaintenance7PropertiesKHR maintenance_7_properties;
     VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptor_heap_properties;
@@ -5316,6 +5433,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceVulkan13Features vulkan_1_3_features;
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering_features;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_features;
+    VkPhysicalDeviceDepthClampZeroOneFeaturesEXT depth_clamp_zero_one_features;
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb_features;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vertex_divisor_features;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border_color_features;
@@ -5791,6 +5909,10 @@ struct d3d12_device
     IAmdExtAntiLagApi IAmdExtAntiLagApi_iface;
     ID3D12DeviceConfiguration1 ID3D12DeviceConfiguration1_iface;
     LONG refcount;
+    uint32_t reserved_compat_resources;
+    uint32_t reserved_compat_update_mappings;
+    uint32_t reserved_compat_copy_mappings;
+    uint32_t reserved_compat_probe_status[ARRAY_SIZE(vkd3d_sparse_probe_formats)];
 
     VkDevice vk_device;
     uint32_t api_version;
@@ -7026,7 +7148,13 @@ void vkd3d_acceleration_structure_emit_immediate_postbuild_info(
         VkAccelerationStructureKHR vk_acceleration_structure,
         VkDeviceAddress va,
         enum vkd3d_rtas_kind rtas_kind);
-void vkd3d_acceleration_structure_copy(
+bool vkd3d_acceleration_structure_deserialize(struct d3d12_command_list *list,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src);
+HRESULT d3d12_command_list_prepare_rtas_metadata(struct d3d12_command_list *list,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src, enum vkd3d_rtas_metadata_op op);
+HRESULT vkd3d_rtas_execute_metadata(struct d3d12_command_queue *queue,
+        const struct vkd3d_rtas_metadata *op, uint64_t *last_submission, bool *quarantine);
+bool vkd3d_acceleration_structure_copy(
         struct d3d12_command_list *list,
         D3D12_GPU_VIRTUAL_ADDRESS dst, VkAccelerationStructureKHR src_as,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode,

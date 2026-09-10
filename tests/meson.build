@@ -1,6 +1,18 @@
 
 vkd3d_test_flags = []
 vkd3d_test_deps = [ lib_d3d12, vkd3d_common_dep ]
+if vkd3d_platform != 'windows'
+  executable('helios-native-admission', 'helios_native_admission.c',
+    dependencies: [vkd3d_dep, lib_dl],
+    link_with: [helios_d3d12_static_lib],
+    include_directories: [vkd3d_private_includes, include_directories('../libs/vkd3d', '..')],
+    install: false)
+  executable('helios-root-contract', 'helios_root_contract.c',
+    dependencies: [vkd3d_dep, lib_dl],
+    link_with: [helios_d3d12_static_lib],
+    include_directories: [vkd3d_private_includes, include_directories('../libs/vkd3d', '..')],
+    install: false)
+endif
 if vkd3d_platform == 'windows'
   vkd3d_test_deps += [ lib_dxgi ]
 endif
@@ -9,7 +21,18 @@ d3d12_test_utils_lib = static_library('d3d12-test-utils', 'd3d12_test_utils.c',
   dependencies        : vkd3d_test_deps,
   include_directories : vkd3d_private_includes)
 
+if vkd3d_platform == 'windows'
+  executable('helios-native-features',
+    ['helios_native_features.c', 'helios_native_debug.cpp', 'd3d12_rov.c', 'd3d12_command.c', 'd3d12_tir.c', 'd3d12_query.c',
+      'd3d12_device.c', 'd3d12_shaders.c', 'd3d12_geometry_shader.c', 'd3d12_tessellation.c', 'd3d12_descriptors.c'],
+    dependencies: vkd3d_test_deps + [vkd3d_compiler.find_library('advapi32')],
+    include_directories: vkd3d_private_includes,
+    link_with: [d3d12_test_utils_lib],
+    install: false)
+endif
+
 d3d12_test_src = [
+  'd3d12_tir.c',
   'd3d12_dxvk_interop_device.c',
   'd3d12_clip_cull_distance.c',
   'd3d12_enhanced_barriers.c',
@@ -45,6 +68,10 @@ d3d12_test_src = [
   'd3d12_va.c',
   'd3d12.c',
 ]
+
+if vkd3d_platform == 'windows'
+  d3d12_test_src += ['helios_native_debug.cpp']
+endif
 
 executable('d3d12', d3d12_test_src,
   dependencies        : vkd3d_test_deps,

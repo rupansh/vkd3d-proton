@@ -45,11 +45,17 @@ enum vkd3d_meta_copy_mode
 #include <cs_resolve_binary_queries.h>
 #include <cs_resolve_predicate.h>
 #include <cs_resolve_query.h>
+#include <cs_dgc_query.h>
 #include <cs_emit_nv_memory_decompression_regions.h>
 #include <cs_emit_nv_memory_decompression_workgroups.h>
 #include <cs_execute_indirect_patch.h>
 #include <cs_execute_indirect_patch_debug_ring.h>
 #include <cs_execute_indirect_multi_dispatch.h>
+#include <cs_tiled_copy_write.h>
+#include <cs_tiled_copy_read.h>
+#include <cs_tiled_copy_rows.h>
+#include <cs_tiled_copy_depth.h>
+#include <fs_tiled_copy_depth.h>
 #include <vs_fullscreen_layer.h>
 #include <vs_fullscreen.h>
 #include <gs_fullscreen.h>

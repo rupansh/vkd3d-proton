@@ -1414,6 +1414,247 @@ void test_vbv_stride_edge_cases(void)
     destroy_test_context(&context);
 }
 
+void test_execute_indirect_gpu_produced_roots(void)
+{
+    static const unsigned int counts[] = {3, 1, 0, 7};
+    const uint32_t zeros[4] = {0};
+    D3D12_ROOT_PARAMETER root_params[3] = {{0}}, producer_params[2] = {{0}};
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {0};
+    D3D12_INDIRECT_ARGUMENT_DESC arguments[3] = {{0}};
+    D3D12_COMMAND_SIGNATURE_DESC signature_desc = {0};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
+    ID3D12RootSignature *producer_root;
+    ID3D12PipelineState *producer;
+    ID3D12CommandSignature *signature;
+    ID3D12Resource *packet, *output, *input, *zero, *readback;
+    ID3D12Resource *packet_default, *alias_source, *alias_target;
+    ID3D12Heap *alias_heap;
+    D3D12_HEAP_DESC heap_desc = {0};
+    D3D12_RESOURCE_BARRIER alias = {0};
+    struct test_context_desc context_desc = {0};
+    struct test_context context;
+    D3D12_VIEWPORT viewport;
+    D3D12_RECT scissor;
+    D3D12_RANGE no_read = {0}, read_range = {0, sizeof(zeros)};
+    uint32_t *parameters, *values;
+    D3D12_GPU_VIRTUAL_ADDRESS address;
+    D3D12_RESOURCE_STATES read_state;
+    unsigned int route = 0, iteration, i;
+    HRESULT hr;
+
+#include "shaders/command/headers/execute_indirect_gpu_producer_cs.h"
+#include "shaders/command/headers/execute_indirect_gpu_consumer_vs.h"
+#include "shaders/command/headers/execute_indirect_gpu_consumer_ps.h"
+
+    context_desc.no_pipeline = true;
+    context_desc.no_root_signature = true;
+    context_desc.no_render_target = true;
+    if (!init_test_context(&context, &context_desc))
+        return;
+    if (!context_supports_dxil(&context))
+    {
+        skip("DXIL is not supported.\n");
+        destroy_test_context(&context);
+        return;
+    }
+
+    root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_params[0].Constants.Num32BitValues = 1;
+    root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    root_params[1].Descriptor.ShaderRegister = 1;
+    root_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    root_desc.NumParameters = ARRAY_SIZE(root_params);
+    root_desc.pParameters = root_params;
+    create_root_signature(context.device, &root_desc, &context.root_signature);
+    producer_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    producer_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    root_desc.NumParameters = ARRAY_SIZE(producer_params);
+    root_desc.pParameters = producer_params;
+    create_root_signature(context.device, &root_desc, &producer_root);
+    producer = create_compute_pipeline_state(context.device, producer_root, execute_indirect_gpu_producer_cs_dxil);
+    init_pipeline_state_desc(&pso_desc, context.root_signature, DXGI_FORMAT_UNKNOWN,
+            &execute_indirect_gpu_consumer_vs_dxil, &execute_indirect_gpu_consumer_ps_dxil, NULL);
+    pso_desc.DepthStencilState.DepthEnable = false;
+    pso_desc.DepthStencilState.StencilEnable = false;
+    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    hr = ID3D12Device_CreateGraphicsPipelineState(context.device, &pso_desc,
+            &IID_ID3D12PipelineState, (void **)&context.pipeline_state);
+    ok(hr == S_OK, "Create graphics pipeline failed, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        ID3D12PipelineState_Release(producer);
+        ID3D12RootSignature_Release(producer_root);
+        destroy_test_context(&context);
+        return;
+    }
+    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    arguments[0].Constant.Num32BitValuesToSet = 1;
+    arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+    arguments[1].ConstantBufferView.RootParameterIndex = 1;
+    arguments[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    signature_desc.ByteStride = 28;
+    signature_desc.NumArgumentDescs = ARRAY_SIZE(arguments);
+    signature_desc.pArgumentDescs = arguments;
+    hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, context.root_signature,
+            &IID_ID3D12CommandSignature, (void **)&signature);
+    ok(hr == S_OK, "Create root-state signature failed, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        ID3D12PipelineState_Release(producer);
+        ID3D12RootSignature_Release(producer_root);
+        destroy_test_context(&context);
+        return;
+    }
+
+    packet_default = create_default_buffer(context.device, 1536, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    heap_desc.SizeInBytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Properties.CreationNodeMask = heap_desc.Properties.VisibleNodeMask = 1;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    hr = ID3D12Device_CreateHeap(context.device, &heap_desc, &IID_ID3D12Heap, (void **)&alias_heap);
+    assert_that(hr == S_OK, "Create alias heap failed, hr %#x.\n", (int)hr);
+    alias_source = create_placed_buffer(context.device, alias_heap, 0, 1536,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    alias_target = create_placed_buffer(context.device, alias_heap, 0, 1536, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    output = create_default_buffer(context.device, sizeof(zeros), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    input = create_upload_buffer(context.device, 256, NULL);
+    zero = create_upload_buffer(context.device, sizeof(zeros), zeros);
+    readback = create_readback_buffer(context.device, sizeof(zeros));
+
+record:
+    packet = route == 2 ? alias_target : packet_default;
+    address = ID3D12Resource_GetGPUVirtualAddress(packet);
+    read_state = route == 1 ? D3D12_RESOURCE_STATE_COMMON :
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    transition_resource_state(context.list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList_CopyBufferRegion(context.list, output, 0, zero, 0, sizeof(zeros));
+    transition_resource_state(context.list, output, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, producer_root);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, producer);
+    ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(context.list, 0, ID3D12Resource_GetGPUVirtualAddress(input));
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context.list, 1,
+            route == 2 ? ID3D12Resource_GetGPUVirtualAddress(alias_source) : address);
+    if (route == 2)
+    {
+        alias.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        alias.Aliasing.pResourceBefore = NULL;
+        alias.Aliasing.pResourceAfter = alias_source;
+        ID3D12GraphicsCommandList_ResourceBarrier(context.list, 1, &alias);
+    }
+    ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+    if (route == 2)
+    {
+        alias.Aliasing.pResourceBefore = alias_source;
+        alias.Aliasing.pResourceAfter = alias_target;
+        ID3D12GraphicsCommandList_ResourceBarrier(context.list, 1, &alias);
+    }
+    else
+        transition_resource_state(context.list, packet, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read_state);
+
+    set_viewport(&viewport, 0, 0, 1, 1, 0, 1);
+    set_rect(&scissor, 0, 0, 1, 1);
+    ID3D12GraphicsCommandList_RSSetViewports(context.list, 1, &viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1, &scissor);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(context.list, 0, 3, 0);
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(context.list, 1, address + 512);
+    ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(context.list, 2, ID3D12Resource_GetGPUVirtualAddress(output));
+
+    /* Force the predicate resolver inline, then switch away from a false
+     * predicate while a rendering instance is active. Neither resolver nor
+     * patch dispatch may be suppressed by the previous application predicate. */
+    ID3D12GraphicsCommandList_SetPredication(context.list, packet, 256, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_SetPredication(context.list, packet, 264, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    ID3D12GraphicsCommandList_ExecuteIndirect(context.list, signature, 3, packet, 284, packet, 280);
+    /* Rebind the valid CBV before drawing: dereferencing the NULL root CBV
+     * left by ExecuteIndirect is undefined D3D12 behavior. This draw witnesses
+     * constant clearing, not CBV clearing. */
+    ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(context.list, 1, address + 512);
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_SetPredication(context.list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    if (route != 2)
+        transition_resource_state(context.list, packet,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition_resource_state(context.list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyBufferRegion(context.list, readback, 0, output, 0, sizeof(zeros));
+    transition_resource_state(context.list, output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(hr == S_OK, "Close failed, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+        goto cleanup;
+
+    for (iteration = 0; iteration < ARRAY_SIZE(counts); iteration++)
+    {
+        /* Only producer input changes on the CPU, after the previous fence.
+         * All CBVs, predicates, counts and indirect payloads are GPU outputs. */
+        hr = ID3D12Resource_Map(input, 0, &no_read, (void **)&parameters);
+        ok(hr == S_OK, "Map producer input failed, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            goto cleanup;
+        parameters[0] = 37 + 16 * iteration + 100 * route;
+        parameters[1] = counts[iteration];
+        parameters[2] = (uint32_t)address;
+        parameters[3] = (uint32_t)(address >> 32);
+        ID3D12Resource_Unmap(input, 0, NULL);
+        exec_command_list(context.queue, context.list);
+        wait_queue_idle(context.device, context.queue);
+        hr = ID3D12Resource_Map(readback, 0, &read_range, (void **)&values);
+        ok(hr == S_OK, "Map readback failed, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            goto cleanup;
+        for (i = 0; i < ARRAY_SIZE(zeros); i++)
+        {
+            unsigned int seed = 37 + 16 * iteration + 100 * route;
+            unsigned int expected = i < min(counts[iteration], 3) ? 2 * (seed + i) : 0;
+            if (!i)
+                expected += 2 * seed;
+            ok(values[i] == expected, "Route %u, replay %u, word %u: got %u, expected %u.\n",
+                    route, iteration, i, values[i], expected);
+        }
+        ID3D12Resource_Unmap(readback, 0, &no_read);
+    }
+
+    if (++route < 3)
+    {
+        reset_command_list(context.list, context.allocator);
+        goto record;
+    }
+
+    /* A recording failure must stay quarantined across Reset. Do not submit
+     * this invalid list. This witnesses E_INVALIDARG, not injected OOM. */
+    reset_command_list(context.list, context.allocator);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    ID3D12GraphicsCommandList_ExecuteIndirect(context.list, signature, 3, packet, 1536, NULL, 0);
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(hr == E_INVALIDARG, "Invalid argument extent: got hr %#x.\n", (int)hr);
+    hr = ID3D12GraphicsCommandList_Reset(context.list, context.allocator, NULL);
+    ok(hr == E_INVALIDARG, "Reset erased failed Close: got hr %#x.\n", (int)hr);
+    hr = ID3D12Device_GetDeviceRemovedReason(context.device);
+    ok(hr == S_OK, "Invalid command list removed device, hr %#x.\n", (int)hr);
+
+cleanup:
+    ID3D12Resource_Release(readback);
+    ID3D12Resource_Release(zero);
+    ID3D12Resource_Release(input);
+    ID3D12Resource_Release(output);
+    ID3D12Resource_Release(packet_default);
+    ID3D12Resource_Release(alias_source);
+    ID3D12Resource_Release(alias_target);
+    ID3D12Heap_Release(alias_heap);
+    ID3D12CommandSignature_Release(signature);
+    ID3D12PipelineState_Release(producer);
+    ID3D12RootSignature_Release(producer_root);
+    destroy_test_context(&context);
+}
+
 void test_execute_indirect_multi_dispatch_root_descriptors(void)
 {
     const unsigned int max_indirect_count = 5;
@@ -1468,14 +1709,6 @@ void test_execute_indirect_multi_dispatch_root_descriptors(void)
     if (!init_compute_test_context(&context))
         return;
 
-    if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
-    {
-        skip("DGC not supported.\n");
-        destroy_test_context(&context);
-        return;
-    }
-
     desc.ByteStride = sizeof(indirect_data.dispatches[0]);
     desc.NodeMask = 0;
     desc.NumArgumentDescs = ARRAY_SIZE(arguments);
@@ -1499,7 +1732,7 @@ void test_execute_indirect_multi_dispatch_root_descriptors(void)
     hr = ID3D12Device_CreateCommandSignature(context.device, &desc, context.root_signature, &IID_ID3D12CommandSignature, (void **)&signature);
     if (FAILED(hr))
         signature = NULL;
-    todo ok(SUCCEEDED(hr), "Failed to create command signature, hr #%x.\n", (int)hr);
+    ok(SUCCEEDED(hr), "Failed to create command signature, hr #%x.\n", (int)hr);
 
     output = create_default_buffer(context.device, ARRAY_SIZE(indirect_data.dispatches) * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     for (i = 0; i < ARRAY_SIZE(indirect_data.dispatches); i++)
@@ -1617,14 +1850,6 @@ void test_execute_indirect_multi_dispatch_root_constants(void)
     if (!init_compute_test_context(&context))
         return;
 
-    if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
-    {
-        skip("DGC not supported.\n");
-        destroy_test_context(&context);
-        return;
-    }
-
     desc.ByteStride = sizeof(uint32_t) + sizeof(D3D12_DISPATCH_ARGUMENTS);
     desc.NodeMask = 0;
     desc.NumArgumentDescs = ARRAY_SIZE(arguments);
@@ -1653,7 +1878,7 @@ void test_execute_indirect_multi_dispatch_root_constants(void)
     hr = ID3D12Device_CreateCommandSignature(context.device, &desc, context.root_signature, &IID_ID3D12CommandSignature, (void **)&signature);
     if (FAILED(hr))
         signature = NULL;
-    todo ok(SUCCEEDED(hr), "Failed to create command signature, hr #%x.\n", (int)hr);
+    ok(SUCCEEDED(hr), "Failed to create command signature, hr #%x.\n", (int)hr);
 
     output = create_default_buffer(context.device, 8 * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     indirect = create_upload_buffer(context.device, sizeof(indirect_data), indirect_data);
@@ -1946,14 +2171,6 @@ void test_execute_indirect_state_predication(void)
     desc.no_root_signature = true;
     if (!init_test_context(&context, &desc))
         return;
-
-    if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
-    {
-        skip("DGC not supported.\n");
-        destroy_test_context(&context);
-        return;
-    }
 
     memset(&rs_desc, 0, sizeof(rs_desc));
     memset(rs_params, 0, sizeof(rs_params));
@@ -2671,14 +2888,6 @@ void test_execute_indirect_state(void)
     if (!init_test_context(&context, &desc))
         return;
 
-    if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
-    {
-        skip("DGC not supported.\n");
-        destroy_test_context(&context);
-        return;
-    }
-
     command_list = context.list;
     queue = context.queue;
 
@@ -3302,14 +3511,6 @@ void test_execute_indirect_state_vbo_offsets(void)
     desc.rt_height = 1;
     if (!init_test_context(&context, &desc))
         return;
-
-    if (is_vkd3d_proton_device(context.device) &&
-        !is_vk_device_extension_supported(context.device, "VK_EXT_device_generated_commands"))
-    {
-        skip("DGC not supported.\n");
-        destroy_test_context(&context);
-        return;
-    }
 
     indirect_buffer = create_upload_buffer(context.device, sizeof(draw), &draw);
     instance_buffer = create_upload_buffer(context.device, sizeof(instance_data), instance_data);

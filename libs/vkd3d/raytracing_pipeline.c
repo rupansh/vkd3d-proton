@@ -420,6 +420,12 @@ struct d3d12_state_object_collection
     const D3D12_EXPORT_DESC *exports;
 };
 
+struct d3d12_state_object_renamed_hit_group
+{
+    D3D12_HIT_GROUP_DESC desc;
+    struct d3d12_state_object_renamed_hit_group *next;
+};
+
 struct d3d12_rt_state_object_pipeline_data
 {
     /* Map 1:1 with VkShaderModule. */
@@ -439,6 +445,9 @@ struct d3d12_rt_state_object_pipeline_data
     const struct D3D12_HIT_GROUP_DESC **hit_groups;
     size_t hit_groups_size;
     size_t hit_groups_count;
+    /* Temporary descriptors with renamed exports. Strings are borrowed until
+     * compilation ends; deferring first deep-copies every hit-group string. */
+    struct d3d12_state_object_renamed_hit_group *renamed_hit_groups;
 
     /* Used to finalize compilation later. */
     const struct D3D12_DXIL_LIBRARY_DESC **dxil_libraries;
@@ -490,7 +499,14 @@ static void d3d12_state_object_pipeline_data_cleanup_modules(struct d3d12_rt_sta
 static void d3d12_state_object_pipeline_data_cleanup_compile_temporaries(struct d3d12_rt_state_object_pipeline_data *data,
         struct d3d12_device *device)
 {
+    struct d3d12_state_object_renamed_hit_group *renamed;
     unsigned int i;
+
+    while ((renamed = data->renamed_hit_groups))
+    {
+        data->renamed_hit_groups = renamed->next;
+        vkd3d_free(renamed);
+    }
 
     for (i = 0; i < data->subobject_root_signatures_count; i++)
         d3d12_root_signature_dec_ref(data->subobject_root_signatures[i]);
@@ -712,12 +728,12 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         else
         {
             for (j = 0; j < num_exports; j++)
-                if (vkd3d_export_equal(exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name, entry))
+                if (vkd3d_export_equal(exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name, entry))
                     break;
 
             if (j < num_exports)
             {
-                export_desc = &exports[i];
+                export_desc = &exports[j];
                 accept_entry_point = true;
             }
         }
@@ -769,6 +785,7 @@ static HRESULT d3d12_state_object_add_collection_deferred(
 
     for (i = 0; i < deferred->hit_groups_count; i++)
     {
+        const D3D12_EXPORT_DESC *export_desc = NULL;
         bool accept_hit_group = false;
 
         if (!num_exports)
@@ -779,11 +796,8 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         {
             for (j = 0; j < num_exports; j++)
             {
-                if (exports[i].ExportToRename)
-                    FIXME("Cannot rename deferred COLLECTION hit group export name.\n");
-
                 if (vkd3d_export_strequal(
-                        exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name,
+                        exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name,
                         deferred->hit_groups[i]->HitGroupExport))
                 {
                     break;
@@ -791,7 +805,10 @@ static HRESULT d3d12_state_object_add_collection_deferred(
             }
 
             if (j < num_exports)
+            {
                 accept_hit_group = true;
+                export_desc = &exports[j];
+            }
         }
 
         if (accept_hit_group)
@@ -800,9 +817,19 @@ static HRESULT d3d12_state_object_add_collection_deferred(
                     data->hit_groups_count + 1, sizeof(*data->hit_groups)))
                 return E_OUTOFMEMORY;
 
-            /* If exports[i].ExportToRename is used, we need a way to partially dup hit group desc.
-             * This is esoteric enough that we'll defer until needed. */
-            data->hit_groups[data->hit_groups_count++] = deferred->hit_groups[i];
+            if (export_desc && export_desc->ExportToRename)
+            {
+                struct d3d12_state_object_renamed_hit_group *renamed;
+                if (!(renamed = vkd3d_malloc(sizeof(*renamed))))
+                    return E_OUTOFMEMORY;
+                renamed->desc = *deferred->hit_groups[i];
+                renamed->desc.HitGroupExport = export_desc->Name;
+                renamed->next = data->renamed_hit_groups;
+                data->renamed_hit_groups = renamed;
+                data->hit_groups[data->hit_groups_count++] = &renamed->desc;
+            }
+            else
+                data->hit_groups[data->hit_groups_count++] = deferred->hit_groups[i];
         }
     }
 
@@ -819,11 +846,8 @@ static HRESULT d3d12_state_object_add_collection_deferred(
         {
             for (j = 0; j < num_exports; j++)
             {
-                if (exports[i].ExportToRename)
-                    FIXME("Cannot rename deferred COLLECTION subobject export name.\n");
-
                 if (vkd3d_export_strequal(
-                        exports[i].ExportToRename ? exports[i].ExportToRename : exports[i].Name,
+                        exports[j].ExportToRename ? exports[j].ExportToRename : exports[j].Name,
                         deferred->subobjects[i].name))
                 {
                     break;
@@ -833,7 +857,7 @@ static HRESULT d3d12_state_object_add_collection_deferred(
             if (j < num_exports)
             {
                 accept_subobject = true;
-                export_desc = &exports[i];
+                export_desc = &exports[j];
             }
         }
 

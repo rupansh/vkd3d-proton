@@ -937,7 +937,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         resource->flags |= VKD3D_RESOURCE_ZERO_INITIALIZED;
     }
 
-    if (sparse_resource)
+    if (sparse_resource || (resource && (resource->flags & VKD3D_RESOURCE_RESERVED_COMPAT)))
     {
         if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
         {
@@ -977,6 +977,31 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     /* Multisample resolve may require shader access */
     if (!(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) || desc->SampleDesc.Count > 1)
         image_info->usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
+    /* MSAA CopyTiles accesses individual samples in raw UINT views. Keep this
+     * extra mutability/storage usage confined to reserved multisample images. */
+    if ((sparse_resource || (resource && (resource->flags & VKD3D_RESOURCE_RESERVED_COMPAT))) &&
+            desc->SampleDesc.Count > 1 && format->vk_aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT)
+    {
+        const struct vkd3d_format *raw = vkd3d_get_format(device,
+                vkd3d_tiled_copy_uint_format(format->byte_count), false);
+        if (!raw)
+            return E_INVALIDARG;
+        image_info->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!(image_info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || format_list->sType)
+        {
+            vkd3d_format_compatibility_list_add_format(compat_list, format->vk_format);
+            vkd3d_format_compatibility_list_add_format(compat_list, raw->vk_format);
+            if (!format_list->sType)
+            {
+                format_list->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+                vk_prepend_struct(image_info, format_list);
+            }
+            format_list->viewFormatCount = compat_list->format_count;
+            format_list->pViewFormats = compat_list->vk_formats;
+        }
+        image_info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
 
     /* Additional usage flags for shader-based copies */
     if (vkd3d_format_allows_sampler_feedback_resolve(format->dxgi_format) ||
@@ -1948,7 +1973,7 @@ void vkd3d_sampler_state_free_descriptor_set(struct vkd3d_sampler_state *state,
     pthread_mutex_unlock(&state->mutex);
 }
 
-static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_resource *resource,
+static HRESULT d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_resource *resource,
         UINT *total_tile_count, D3D12_PACKED_MIP_INFO *packed_mip_info, D3D12_TILE_SHAPE *tile_shape,
         D3D12_SUBRESOURCE_TILING *tilings, VkSparseImageMemoryRequirements *vk_info)
 {
@@ -1993,10 +2018,14 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
         if (!memory_requirement_count)
         {
             ERR("Failed to query sparse memory requirements.\n");
-            return;
+            return E_FAIL;
         }
 
-        memory_requirements = vkd3d_malloc(memory_requirement_count * sizeof(*memory_requirements));
+        if (!(memory_requirements = vkd3d_calloc(memory_requirement_count, sizeof(*memory_requirements))))
+        {
+            ERR("Failed to allocate sparse memory requirements.\n");
+            return E_OUTOFMEMORY;
+        }
 
         VK_CALL(vkGetImageSparseMemoryRequirements(device->vk_device,
                 resource->res.vk_image, &memory_requirement_count, memory_requirements));
@@ -2008,6 +2037,15 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
         }
 
         vkd3d_free(memory_requirements);
+
+        if (!vk_info->formatProperties.aspectMask ||
+                !vk_info->formatProperties.imageGranularity.width ||
+                !vk_info->formatProperties.imageGranularity.height ||
+                !vk_info->formatProperties.imageGranularity.depth)
+        {
+            ERR("Sparse image has no usable data-aspect memory requirements.\n");
+            return E_FAIL;
+        }
 
         /* Assume that there is no mip tail if either the size is zero or
          * if the first LOD is out of range. It's not clear what drivers
@@ -2077,8 +2115,8 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
             unsigned int width, height;
         } size_table[] = {
             { 1, 1, 256, 256 },
-            { 1, 2, 128, 128 },
-            { 1, 4, 128, 256 },
+            { 1, 2, 128, 256 },
+            { 1, 4, 128, 128 },
             { 1, 8, 64, 128 },
             { 1, 16, 64, 64 },
 
@@ -2110,11 +2148,12 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
         const struct standard_sizes *sizes = NULL;
 
         for (i = 0; i < ARRAY_SIZE(size_table) && !sizes; i++)
-            if (size_table[i].byte_count == format->byte_count && desc->SampleDesc.Count == size_table[i].samples)
+            if (size_table[i].byte_count == format->byte_count * format->block_byte_count &&
+                    desc->SampleDesc.Count == size_table[i].samples)
                 sizes = &size_table[i];
 
-        /* Just have to hallucinate something reasonable. Pretend every LOD is standard layout.
-         * We only attempt this for 2D images, ignore 3D cases. */
+        /* Compatibility reflection: every mip has standard tiles, with no
+         * packed tail. This describes CopyTiles geometry, not physical pages. */
         assert(desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
         packed_mip_info->NumStandardMips = desc->MipLevels;
         packed_mip_info->NumTilesForPackedMips = 0;
@@ -2129,14 +2168,19 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
         else
         {
             WARN("Unrecognized byte_size %u, samples %u pair.\n", format->byte_count, desc->SampleDesc.Count);
-            /* Just hallucinate something so we don't crash. */
-            block_extent.width = 256;
-            block_extent.height = 256;
+            return E_NOTIMPL;
         }
 
         tile_shape->WidthInTexels = block_extent.width;
         tile_shape->HeightInTexels = block_extent.height;
         tile_shape->DepthInTexels = 1;
+
+        /* The tile-copy metadata builder also needs the synthetic texel
+         * geometry. These requirements are never passed to vkQueueBindSparse. */
+        vk_info->formatProperties.aspectMask = format->vk_aspect_mask;
+        vk_info->formatProperties.imageGranularity.width = block_extent.width;
+        vk_info->formatProperties.imageGranularity.height = block_extent.height;
+        vk_info->formatProperties.imageGranularity.depth = 1;
 
         tile_count = 0;
 
@@ -2156,6 +2200,7 @@ static void d3d12_resource_get_tiling(struct d3d12_device *device, struct d3d12_
 
         *total_tile_count = tile_count;
     }
+    return S_OK;
 }
 
 static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12_device *device);
@@ -2886,7 +2931,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_GetHeapProperties(d3d12_resource
         return S_OK;
     }
 
-    if (resource->flags & VKD3D_RESOURCE_RESERVED)
+    if (d3d12_resource_is_tiled(resource))
     {
         WARN("Cannot get heap properties for reserved resources.\n");
         return E_INVALIDARG;
@@ -3840,10 +3885,11 @@ static HRESULT d3d12_resource_init_sparse_info(struct d3d12_resource *resource,
         return E_OUTOFMEMORY;
     }
 
-    d3d12_resource_get_tiling(device, resource, &sparse->tile_count, &sparse->packed_mips,
-            &sparse->tile_shape, sparse->tilings, &vk_memory_requirements);
+    if (FAILED(hr = d3d12_resource_get_tiling(device, resource, &sparse->tile_count, &sparse->packed_mips,
+            &sparse->tile_shape, sparse->tilings, &vk_memory_requirements)))
+        return hr;
 
-    if (!(sparse->tiles = vkd3d_malloc(sparse->tile_count * sizeof(*sparse->tiles))))
+    if (!(sparse->tiles = vkd3d_calloc(sparse->tile_count, sizeof(*sparse->tiles))))
     {
         ERR("Failed to allocate tile mapping array.\n");
         return E_OUTOFMEMORY;
@@ -4010,7 +4056,6 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     if (resource->flags & VKD3D_RESOURCE_EXTERNAL)
         return;
 
-    vkd3d_free(resource->sparse.tiles);
     vkd3d_free(resource->sparse.tilings);
 
     if (resource->flags & VKD3D_RESOURCE_RESERVED)
@@ -4025,6 +4070,17 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
         VK_CALL(vkDestroyImage(device->vk_device, resource->res.vk_image, NULL));
     else if (resource->flags & VKD3D_RESOURCE_RESERVED)
         VK_CALL(vkDestroyBuffer(device->vk_device, resource->res.vk_buffer, NULL));
+
+    /* Destroy the reserved Vulkan resource before dropping its mapping owners.
+     * In-flight sparse binds independently retain the resource until completion. */
+    if (resource->sparse.tiles)
+    {
+        unsigned int i;
+        for (i = 0; i < resource->sparse.tile_count; i++)
+            if (resource->sparse.tiles[i].helios_heap)
+                d3d12_heap_decref(resource->sparse.tiles[i].helios_heap);
+        vkd3d_free(resource->sparse.tiles);
+    }
 
     d3d12_resource_close_export_kmt(resource, device);
 
@@ -4341,17 +4397,17 @@ HRESULT d3d12_resource_create_borrowed(struct d3d12_device *device, const D3D12_
     return hr;
 }
 
-HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+static HRESULT d3d12_resource_create_committed_flags(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value,
         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
-        HANDLE shared_handle, struct d3d12_resource **resource)
+        HANDLE shared_handle, unsigned int extra_resource_flags, struct d3d12_resource **resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct d3d12_resource *object;
     HRESULT hr;
 
-    if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION,
+    if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION | extra_resource_flags,
             desc, heap_properties, heap_flags, initial_state, optimized_clear_value,
             num_castable_formats, castable_formats,
             &object)))
@@ -4616,6 +4672,16 @@ fail:
     return hr;
 }
 
+HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
+        const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
+        const D3D12_CLEAR_VALUE *optimized_clear_value,
+        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
+        HANDLE shared_handle, struct d3d12_resource **resource)
+{
+    return d3d12_resource_create_committed_flags(device, desc, heap_properties, heap_flags, initial_state,
+            optimized_clear_value, num_castable_formats, castable_formats, shared_handle, 0, resource);
+}
+
 static HRESULT d3d12_resource_validate_heap(const D3D12_RESOURCE_DESC1 *resource_desc, struct d3d12_heap *heap)
 {
     D3D12_HEAP_FLAGS deny_flag;
@@ -4854,34 +4920,7 @@ fail:
     return hr;
 }
 
-static HRESULT d3d12_resource_create_reserved_fallback(
-        struct d3d12_device *device,
-        const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
-        const D3D12_CLEAR_VALUE *optimized_clear_value,
-        UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
-        struct d3d12_resource **resource)
-{
-    D3D12_HEAP_PROPERTIES heap_props;
-    struct d3d12_resource *object;
-    HRESULT hr;
-
-    memset(&heap_props, 0, sizeof(heap_props));
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    if (FAILED(hr = d3d12_resource_create_committed(device, desc, &heap_props, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
-            initial_state, optimized_clear_value, num_castable_formats, castable_formats, NULL, &object)))
-        return hr;
-
-    if (FAILED(hr = d3d12_resource_init_sparse_info(object, device, &object->sparse)))
-        goto fail;
-
-    *resource = object;
-    return S_OK;
-
-fail:
-    d3d12_resource_destroy_and_release_device(object, device);
-    return hr;
-}
+#include "reserved_compat.h"
 
 HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
@@ -4899,21 +4938,14 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         if (!format)
             return E_INVALIDARG;
 
-        /* Check that implementation supports sparse for the format at all.
-         * RADV does not support depth-stencil sparse for example.
-         * Letting this through is better than straight up crashing ...
-         * Don't allow multi-aspect images. They have to fail. */
+        /* Owner-authorized upstream compatibility fallback, plus a behavior
+         * check for advertised color4 support. Multi-aspect images still fail. */
         if (vkd3d_popcount(format->vk_aspect_mask) == 1 &&
-                !(format->supported_sparse_sample_counts & desc->SampleDesc.Count))
+                (!(format->supported_sparse_sample_counts & desc->SampleDesc.Count) ||
+                    vkd3d_reserved_compat_required(device, format, desc->SampleDesc.Count)))
         {
-            FIXME("Sparse is not supported for vk_format %d with %u samples, falling back to committed resource. "
-                  "Dimensions: width %u, height %u, level %u, layers %u. VRAM bloat expected.\n",
-                    format->vk_format, desc->SampleDesc.Count,
-                    (unsigned int)desc->Width, desc->Height,
-                    desc->MipLevels, desc->DepthOrArraySize);
-
-            return d3d12_resource_create_reserved_fallback(device, desc, initial_state,
-                    optimized_clear_value, num_castable_formats, castable_formats, resource);
+            return d3d12_resource_create_reserved_fallback(device, desc, initial_state, optimized_clear_value,
+                    num_castable_formats, castable_formats, resource);
         }
     }
 
@@ -4937,7 +4969,8 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         if (!object->res.va)
         {
             ERR("Failed to get VA for sparse resource.\n");
-            return E_FAIL;
+            hr = E_FAIL;
+            goto fail;
         }
 
         vkd3d_va_map_insert(&device->memory_allocator.va_map, &object->res);
@@ -5375,10 +5408,14 @@ bool vkd3d_create_acceleration_structure_view(struct d3d12_device *device, const
      * query redundant (but cheap). On v1 it may differ for non-GENERIC AS types;
      * for GENERIC ASes real drivers return buffer_address, though the spec only
      * mandates relative-offset consistency between GENERIC ASes in the same buffer.
-     * The FIXME guards against driver divergence. */
+     * Native instance and serialized pointers require equality; refuse divergence. */
     if (buffer_address != rtas_address)
     {
-        FIXME("buffer_address = 0x%"PRIx64", rtas_address = 0x%"PRIx64".\n", buffer_address, rtas_address);
+        ERR("AS address differs from buffer GPUVA: buffer 0x%"PRIx64", AS 0x%"PRIx64".\n",
+                buffer_address, rtas_address);
+        VK_CALL(vkDestroyAccelerationStructureKHR(device->vk_device, vk_acceleration_structure, NULL));
+        vkd3d_free(object);
+        return false;
     }
 
     object->vk_acceleration_structure = vk_acceleration_structure;
@@ -10721,7 +10758,7 @@ HRESULT d3d12_query_heap_resolve_cpu(struct d3d12_query_heap *heap, D3D12_QUERY_
 {
     /* Fortunately, there are no synchronization semantics for CPU query resolves. */
     const struct vkd3d_vk_device_procs *vk_procs = &heap->device->vk_procs;
-    uint32_t query_size;
+    size_t query_size;
     VkResult vr;
     UINT i;
 
@@ -10730,10 +10767,15 @@ HRESULT d3d12_query_heap_resolve_cpu(struct d3d12_query_heap *heap, D3D12_QUERY_
 
     query_size = d3d12_query_heap_type_get_data_size(heap->desc.Type);
 
-    if (index + count > heap->desc.Count)
+    if (index > heap->desc.Count || count > heap->desc.Count - index)
         return E_INVALIDARG;
 
-    if (!d3d12_query_heap_type_is_inline(heap->desc.Type))
+    if (!count)
+        return S_OK;
+    if (!data || !query_size || index > SIZE_MAX / query_size || count > SIZE_MAX / query_size)
+        return E_INVALIDARG;
+
+    if (!heap->inline_queries)
     {
         /* If the query is backed by query pool as-is, then we just read that. */
         vr = VK_CALL(vkGetQueryPoolResults(heap->device->vk_device,
@@ -10790,7 +10832,11 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
     object->flags = flags;
     object->cookie = vkd3d_allocate_cookie();
 
-    if (!d3d12_query_heap_type_is_inline(desc->Type))
+    object->inline_queries = d3d12_query_heap_type_is_inline(desc->Type) ||
+            (desc->Type == D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS &&
+            device->device_info.device_generated_commands_features.deviceGeneratedCommands);
+
+    if (!object->inline_queries)
     {
         pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         pool_info.pNext = NULL;
@@ -10897,6 +10943,7 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
                 ERR("Failed to map query heap memory.\n");
                 vkd3d_free_device_memory(device, &object->device_allocation);
                 VK_CALL(vkDestroyBuffer(device->vk_device, object->vk_buffer, NULL));
+                vkd3d_free(object);
                 return hresult_from_vk_result(vr);
             }
         }
@@ -10910,6 +10957,9 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
 
     if (FAILED(hr = vkd3d_private_store_init(&object->private_store)))
     {
+        VK_CALL(vkDestroyQueryPool(device->vk_device, object->vk_query_pool, NULL));
+        VK_CALL(vkDestroyBuffer(device->vk_device, object->vk_buffer, NULL));
+        vkd3d_free_device_memory(device, &object->device_allocation);
         vkd3d_free(object);
         return hr;
     }

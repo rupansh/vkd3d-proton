@@ -22,6 +22,8 @@
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 #include "d3d12_crosstest.h"
 
+#include "d3d12_filter_reduction.h"
+
 void test_create_descriptor_heap(void)
 {
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc;

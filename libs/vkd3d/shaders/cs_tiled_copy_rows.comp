@@ -1,0 +1,36 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_8bit_storage : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Words { uint data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) buffer Bytes { uint8_t data[]; };
+layout(push_constant, scalar) uniform Args
+{
+    uint64_t src_va, dst_va, predicate_va;
+    uint row_pitch, slice_pitch, row_bytes, rows, depth, padding;
+} args;
+
+void main()
+{
+    uint offset = gl_GlobalInvocationID.x * 4;
+    if (offset >= 65536 || Words(args.predicate_va).data[0] == 0)
+        return;
+    uint z = offset / args.slice_pitch;
+    uint y = (offset % args.slice_pitch) / args.row_pitch;
+    uint x = offset % args.row_pitch;
+    if (z >= args.depth || y >= args.rows || x >= args.row_bytes)
+        return;
+    uint count = min(4u, args.row_bytes - x);
+    uint64_t src = args.src_va + offset, dst = args.dst_va + offset;
+    // One invocation owns a DWORD. Byte stores preserve unaligned endpoints
+    // and subword edge rows without touching neighboring bytes.
+    if (count == 4 && ((src | dst) & uint64_t(3)) == uint64_t(0))
+        Words(dst).data[0] = Words(src).data[0];
+    else
+        for (uint i = 0; i < count; i++)
+            Bytes(dst).data[i] = Bytes(src).data[i];
+}

@@ -406,57 +406,68 @@ static dxil_spv_bool dxil_input_remap(void *userdata, const dxil_spv_d3d_vertex_
     return DXIL_SPV_TRUE;
 }
 
-static dxil_spv_bool dxil_output_remap(void *userdata, const dxil_spv_d3d_stream_output *d3d_output,
-                                       dxil_spv_vulkan_stream_output *vk_output)
+struct vkd3d_dxil_xfb_context
 {
-    const struct vkd3d_shader_transform_feedback_info *xfb_info = userdata;
-    const struct vkd3d_shader_transform_feedback_element *xfb_element;
-    unsigned int buffer_offsets[D3D12_SO_BUFFER_SLOT_COUNT];
-    unsigned int i, stride;
+    const struct vkd3d_shader_transform_feedback_info *info;
+    uint8_t matched_components[512];
+    unsigned int max_output_components;
+    unsigned int max_total_output_components;
+};
 
-    memset(buffer_offsets, 0, sizeof(buffer_offsets));
-    xfb_element = NULL;
+static dxil_spv_bool dxil_output_component_remap(void *userdata,
+        const dxil_spv_d3d_stream_output_component *output, dxil_spv_vulkan_stream_output_component *vk_output)
+{
+    struct vkd3d_dxil_xfb_context *context = userdata;
+    const struct vkd3d_shader_transform_feedback_info *info = context->info;
+    unsigned int offsets[D3D12_SO_BUFFER_SLOT_COUNT] = {0};
+    unsigned int i, capture = 0;
 
-    for (i = 0; i < xfb_info->element_count; ++i)
+    vk_output->enable = DXIL_SPV_FALSE;
+    for (i = 0; i < info->element_count; i++)
     {
-        const struct vkd3d_shader_transform_feedback_element *e = &xfb_info->elements[i];
-
-        /* TODO: Stream index matching? */
-        if (!ascii_strcasecmp(e->semantic_name, d3d_output->semantic) && e->semantic_index == d3d_output->semantic_index)
+        const struct vkd3d_shader_transform_feedback_element *e = &info->elements[i];
+        unsigned int component = output->semantic_component;
+        bool match = false;
+        if (e->output_slot >= D3D12_SO_BUFFER_SLOT_COUNT || e->stream_index >= D3D12_SO_STREAM_COUNT ||
+                !e->component_count)
+            return DXIL_SPV_FALSE;
+        if (e->semantic_name && e->stream_index == output->stream_index)
         {
-            xfb_element = e;
-            break;
+            /* Public semantics can legally spell this name. Only the private
+             * native-DDI factory may select physical-register coordinates. */
+            if (info->helios_so_registers && !strcmp(e->semantic_name, "__HELIOS_DDI_SO_REGISTER"))
+            {
+                if (e->semantic_index >= 32 || e->component_index >= 4 || e->component_count > 4 - e->component_index)
+                    return DXIL_SPV_FALSE;
+                match = e->semantic_index == output->register_index;
+                component = output->component_index;
+            }
+            else
+                match = !ascii_strcasecmp(e->semantic_name, output->semantic) &&
+                        e->semantic_index == output->semantic_index;
+            match = match && component >= e->component_index &&
+                    component - e->component_index < e->component_count;
         }
-
-        buffer_offsets[e->output_slot] += 4 * e->component_count;
-    }
-
-    if (!xfb_element)
-    {
-        vk_output->enable = DXIL_SPV_FALSE;
-        return DXIL_SPV_TRUE;
-    }
-
-    if (xfb_element->output_slot < xfb_info->buffer_stride_count)
-    {
-        stride = xfb_info->buffer_strides[xfb_element->output_slot];
-    }
-    else
-    {
-        stride = 0;
-        for (i = 0; i < xfb_info->element_count; ++i)
+        if (match && capture++ == output->capture_index)
         {
-            const struct vkd3d_shader_transform_feedback_element *e = &xfb_info->elements[i];
-
-            if (e->stream_index == xfb_element->stream_index && e->output_slot == xfb_element->output_slot)
-                stride += 4 * e->component_count;
+            unsigned int stride = 0, j;
+            if (e->output_slot < info->buffer_stride_count)
+                stride = info->buffer_strides[e->output_slot];
+            else
+                for (j = 0; j < info->element_count; j++)
+                    if (info->elements[j].output_slot == e->output_slot)
+                        stride += 4 * info->elements[j].component_count;
+            context->matched_components[i] |= 1u << (component - e->component_index);
+            vk_output->enable = DXIL_SPV_TRUE;
+            vk_output->max_output_components = context->max_output_components;
+            vk_output->max_total_output_components = context->max_total_output_components;
+            vk_output->offset = offsets[e->output_slot] + 4 * (component - e->component_index);
+            vk_output->stride = stride;
+            vk_output->buffer_index = e->output_slot;
+            return DXIL_SPV_TRUE;
         }
+        offsets[e->output_slot] += 4 * e->component_count;
     }
-
-    vk_output->enable = DXIL_SPV_TRUE;
-    vk_output->offset = buffer_offsets[xfb_element->output_slot];
-    vk_output->stride = stride;
-    vk_output->buffer_index = xfb_element->output_slot;
     return DXIL_SPV_TRUE;
 }
 
@@ -1303,6 +1314,27 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
             }
         }
 
+        if (compiler_args->emulate_forced_sample_count_one)
+        {
+            const dxil_spv_option_base helper = { DXIL_SPV_OPTION_HELIOS_FORCED_SAMPLE_COUNT_ONE };
+            if (dxil_spv_converter_add_option(converter, &helper) != DXIL_SPV_SUCCESS)
+            {
+                ERR("dxil-spirv does not support forced-one-sample coverage.\n");
+                return VKD3D_ERROR_NOT_IMPLEMENTED;
+            }
+        }
+
+        if (compiler_args->tir_single_sample_output)
+        {
+            const dxil_spv_option_helios_tir_single_sample_output helper =
+                    {{ DXIL_SPV_OPTION_HELIOS_TIR_SINGLE_SAMPLE_OUTPUT }, compiler_args->tir_alpha_to_coverage};
+            if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+            {
+                ERR("dxil-spirv does not support single-sample TIR output.\n");
+                return VKD3D_ERROR_NOT_IMPLEMENTED;
+            }
+        }
+
         if (compiler_args->output_swizzle_count != 0)
         {
             const dxil_spv_option_output_swizzle helper =
@@ -1436,6 +1468,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         const struct vkd3d_shader_compile_arguments *compiler_args, bool is_dxil)
 {
     uint32_t wave_size_min, wave_size_max, wave_size_preferred;
+    struct vkd3d_dxil_xfb_context xfb_context = {0};
     struct vkd3d_dxil_remap_userdata remap_userdata;
     unsigned int raw_va_binding_count = 0;
     unsigned int num_root_descriptors = 0;
@@ -1579,7 +1612,17 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     dxil_spv_converter_set_vertex_input_remapper(converter, dxil_input_remap, (void *)shader_interface_info);
 
     if (shader_interface_info->xfb_info)
-        dxil_spv_converter_set_stream_output_remapper(converter, dxil_output_remap, (void *)shader_interface_info->xfb_info);
+    {
+        xfb_context.info = shader_interface_info->xfb_info;
+        xfb_context.max_output_components = compiler_args ? compiler_args->max_output_components : 0;
+        xfb_context.max_total_output_components = compiler_args ? compiler_args->max_total_output_components : 0;
+        if (xfb_context.info->element_count > ARRAY_SIZE(xfb_context.matched_components))
+        {
+            ret = VKD3D_ERROR_INVALID_ARGUMENT;
+            goto end;
+        }
+        dxil_spv_converter_set_stream_output_component_remapper(converter, dxil_output_component_remap, &xfb_context);
+    }
 
     if (shader_interface_info->stage_input_map)
         dxil_spv_converter_set_stage_input_remapper(converter, dxil_shader_stage_input_remap, (void *)shader_interface_info->stage_input_map);
@@ -1594,6 +1637,21 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     {
         ret = VKD3D_ERROR_INVALID_ARGUMENT;
         goto end;
+    }
+
+    if (xfb_context.info)
+    {
+        for (i = 0; i < xfb_context.info->element_count; i++)
+        {
+            const struct vkd3d_shader_transform_feedback_element *e = &xfb_context.info->elements[i];
+            if (e->semantic_name && (e->component_count > 4 ||
+                    xfb_context.matched_components[i] != (1u << e->component_count) - 1u))
+            {
+                ERR("Stream-output entry %u does not match the shader output signature.\n", i);
+                ret = VKD3D_ERROR_INVALID_ARGUMENT;
+                goto end;
+            }
+        }
     }
 
     {
@@ -2355,10 +2413,45 @@ int vkd3d_shader_dxil_append_library_entry_points_and_subobjects(
 
             if (j < rdat_count)
             {
-                vkd3d_array_reserve((void**)subobjects, subobjects_size,
-                        *subobjects_count + 1, sizeof(**subobjects));
+                WCHAR *export_name = NULL, *hit_group_name = NULL;
+
+                /* The import selector names the RDAT source; Name is the
+                 * exported identifier visible to the enclosing state object.
+                 * A hit-group payload also carries that externally visible
+                 * identifier and owns its own allocation. */
+                if (library_desc->pExports[i].ExportToRename)
+                {
+                    export_name = vkd3d_wstrdup(library_desc->pExports[i].Name);
+                    if (sub.kind == DXIL_SPV_RDAT_SUBOBJECT_KIND_HIT_GROUP)
+                        hit_group_name = vkd3d_wstrdup(library_desc->pExports[i].Name);
+                    if (!export_name || (sub.kind == DXIL_SPV_RDAT_SUBOBJECT_KIND_HIT_GROUP && !hit_group_name))
+                    {
+                        vkd3d_free(export_name);
+                        vkd3d_free(hit_group_name);
+                        ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                        goto end;
+                    }
+                }
+                if (!vkd3d_array_reserve((void**)subobjects, subobjects_size,
+                        *subobjects_count + 1, sizeof(**subobjects)))
+                {
+                    vkd3d_free(export_name);
+                    vkd3d_free(hit_group_name);
+                    ret = VKD3D_ERROR_OUT_OF_MEMORY;
+                    goto end;
+                }
                 subobject = &(*subobjects)[*subobjects_count];
                 vkd3d_shader_dxil_copy_subobject(identifier, subobject, &sub);
+                if (export_name)
+                {
+                    vkd3d_free(subobject->name);
+                    subobject->name = export_name;
+                }
+                if (hit_group_name)
+                {
+                    vkd3d_free((void *)subobject->data.hit_group.HitGroupExport);
+                    subobject->data.hit_group.HitGroupExport = hit_group_name;
+                }
                 *subobjects_count += 1;
                 vkd3d_free(ascii_entry);
                 ascii_entry = NULL;

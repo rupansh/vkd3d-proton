@@ -324,10 +324,22 @@ static ID3D12Resource *duplicate_acceleration_structure(struct raytracing_test_c
         ID3D12Resource *rtas, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode)
 {
     ID3D12Resource *new_rtas;
+    D3D12_GPU_VIRTUAL_ADDRESS src, dst;
+    uint64_t extent = ID3D12Resource_GetDesc(rtas).Width;
 
     new_rtas = create_default_buffer(context->context.device, ID3D12Resource_GetDesc(rtas).Width,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+
+    src = ID3D12Resource_GetGPUVirtualAddress(rtas);
+    dst = ID3D12Resource_GetGPUVirtualAddress(new_rtas);
+    /* The original buffer width comes from GetPrebuildInfo. This helper keeps
+     * that bound through both compaction and clone. Record the real allocation
+     * extents separately from the engine's larger Vulkan AS view extents. */
+    ok(src != dst && (src < dst ? dst - src : src - dst) >= extent,
+            "AS copy allocation bounds overlap.\n");
+    trace("RTAS_COPY_RANGE,mode=%u,src=%#"PRIx64",dst=%#"PRIx64",extent=%"PRIu64"\n",
+            mode, src, dst, extent);
 
     ID3D12GraphicsCommandList4_CopyRaytracingAccelerationStructure(context->list4,
             ID3D12Resource_GetGPUVirtualAddress(new_rtas),
@@ -1145,6 +1157,8 @@ static ID3D12StateObject *rt_pso_add_to_state_object(ID3D12Device5 *device, ID3D
 enum rt_test_mode
 {
     TEST_MODE_PLAIN,
+    TEST_MODE_SERIALIZE,
+    TEST_MODE_SERIALIZE_LARGE,
     TEST_MODE_TRACE_RAY_FORCE_OPAQUE,
     TEST_MODE_TRACE_RAY_FORCE_NON_OPAQUE,
     TEST_MODE_TRACE_RAY_SKIP_TRIANGLES,
@@ -1221,6 +1235,9 @@ static uint32_t test_mode_to_trace_flags(enum rt_test_mode mode)
     }
 }
 
+#include "d3d12_rtas_serialization.h"
+#include "d3d12_rtas_recording.h"
+
 static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TIER minimum_tier)
 {
 #define NUM_GEOM_DESC 6
@@ -1267,7 +1284,9 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
     unsigned int ref_count;
     ID3D12Device *device;
     ID3D12Resource *sbt;
+    ID3D12Resource *restored[7] = {0};
     HRESULT hr;
+    unsigned int serialized_instance_count = mode == TEST_MODE_SERIALIZE_LARGE ? 8193 : NUM_UNMASKED_INSTANCES;
 
     if (!init_raytracing_test_context(&context, minimum_tier))
         return;
@@ -1285,7 +1304,7 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
     init_test_geometry(device, &test_geom);
     init_rt_geometry(&context, &test_rtases, &test_geom,
             NUM_GEOM_DESC, GEOM_OFFSET_X,
-            NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y,
+            serialized_instance_count, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y,
             ID3D12Resource_GetGPUVirtualAddress(postbuild_buffer));
 
     /* Create global root signature. All RT shaders can access these parameters. */
@@ -1847,6 +1866,17 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
         command_signature = create_command_signature(device, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS);
     command_signature_cs = create_command_signature(device, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
 
+    if (mode == TEST_MODE_SERIALIZE || mode == TEST_MODE_SERIALIZE_LARGE)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC as_desc = {0};
+        test_rtas_serialization_roundtrip(&context, &test_rtases, restored);
+        as_desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        as_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        as_desc.RaytracingAccelerationStructure.Location = ID3D12Resource_GetGPUVirtualAddress(restored[6]) + 256;
+        ID3D12Device_CreateShaderResourceView(device, NULL, &as_desc,
+                ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(descriptor_heap));
+    }
+
     ID3D12GraphicsCommandList4_SetComputeRootSignature(command_list4, global_rs);
     ID3D12GraphicsCommandList4_SetPipelineState1(command_list4, rt_pso);
     ID3D12GraphicsCommandList4_SetDescriptorHeaps(command_list4, 1, &descriptor_heap);
@@ -2025,7 +2055,7 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
             ok(bottom[0].serialize.SerializedSizeInBytes > 0, "Serialized size for bottom acceleration structure is %u.\n", (unsigned int)bottom[0].serialize.SerializedSizeInBytes);
             ok(bottom[0].serialize.NumBottomLevelAccelerationStructurePointers == 0, "NumBottomLevel pointers is %u.\n", (unsigned int)bottom[0].serialize.NumBottomLevelAccelerationStructurePointers);
             ok(top[0].serialize.SerializedSizeInBytes > 0, "Serialized size for top acceleration structure is %u.\n", (unsigned int)top[0].serialize.SerializedSizeInBytes);
-            ok(top[0].serialize.NumBottomLevelAccelerationStructurePointers == NUM_UNMASKED_INSTANCES + 1,
+            ok(top[0].serialize.NumBottomLevelAccelerationStructurePointers == serialized_instance_count + 1,
                     "NumBottomLevel pointers is %u.\n", (unsigned int)top[0].serialize.NumBottomLevelAccelerationStructurePointers);
 
             ID3D12Resource_Unmap(postbuild_readback, 0, NULL);
@@ -2034,6 +2064,9 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
 
     destroy_test_geometry(&test_geom);
     destroy_rt_geometry(&test_rtases);
+    for (i = 0; i < ARRAY_SIZE(restored); i++)
+        if (restored[i])
+            ID3D12Resource_Release(restored[i]);
     if (sbt_colors_buffer)
         ID3D12Resource_Release(sbt_colors_buffer);
     ID3D12RootSignature_Release(global_rs);
@@ -2065,6 +2098,16 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
         ID3D12Resource_Release(indirect_buffer);
 
     destroy_raytracing_test_context(&context);
+}
+
+void test_raytracing_serialization(void)
+{
+    test_raytracing_pipeline(TEST_MODE_SERIALIZE, D3D12_RAYTRACING_TIER_1_0);
+}
+
+void test_raytracing_serialization_large(void)
+{
+    test_raytracing_pipeline(TEST_MODE_SERIALIZE_LARGE, D3D12_RAYTRACING_TIER_1_0);
 }
 
 void test_raytracing(void)
@@ -3669,6 +3712,233 @@ pso_error:
     destroy_raytracing_test_context(&context);
 }
 
+void test_raytracing_deferred_collection_exports(void)
+{
+    static const LPCWSTR names[][2] = {
+        { u"A", u"B" }, { u"A", u"B" }, { u"grs", u"grs2" }, { u"RootA", u"RootB" },
+    };
+    static const char *const case_names[] = { "selective B", "reversed B,A", "renamed B" };
+    static const LPCWSTR shader_names[] = { u"main", u"other" };
+    struct raytracing_test_context context;
+    D3D12_EXPORT_DESC library_exports[2];
+    ID3D12StateObjectProperties *props;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc;
+    D3D12_ROOT_PARAMETER rs_param;
+    struct rt_pso_factory factory;
+    ID3D12StateObject *collection;
+    D3D12_HIT_GROUP_DESC groups[2];
+    ID3D12StateObject *rtpso;
+    ID3D12RootSignature *rs;
+    unsigned int kind, test, i;
+    D3D12_EXPORT_DESC *imports;
+    unsigned int count;
+
+    if (!init_raytracing_test_context(&context, D3D12_RAYTRACING_TIER_1_0))
+        return;
+
+    memset(&rs_desc, 0, sizeof(rs_desc));
+    memset(&rs_param, 0, sizeof(rs_param));
+    rs_desc.NumParameters = 1;
+    rs_desc.pParameters = &rs_param;
+    rs_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    create_root_signature(context.context.device, &rs_desc, &rs);
+
+    /* Exercise each independently filtered deferred array: shader entry points,
+     * hit groups, and embedded named subobjects. The collection deliberately
+     * leaves shader/pipeline configuration to its enclosing state object.
+     * Kinds 2/3 exercise RDAT directly in the engine. Native Helios receives
+     * DXIL-only DDI libraries and separate resolved subobjects/associations. */
+    for (kind = 0; kind < ARRAY_SIZE(names); kind++)
+    {
+        vkd3d_test_set_context("kind %u", kind);
+        memset(library_exports, 0, sizeof(library_exports));
+        memset(groups, 0, sizeof(groups));
+        rt_pso_factory_init(&factory);
+        for (i = 0; i < 2; i++)
+        {
+            library_exports[i].Name = names[kind][i];
+            library_exports[i].ExportToRename = kind == 3 ? names[2][i] : kind == 2 ? NULL : u"main";
+            groups[i].HitGroupExport = names[kind][i];
+            groups[i].Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;
+        }
+        if (kind == 1)
+        {
+            rt_pso_factory_add_hit_group(&factory, &groups[0]);
+            rt_pso_factory_add_hit_group(&factory, &groups[1]);
+        }
+        else
+        {
+            rt_pso_factory_add_dxil_library(&factory, kind >= 2 ?
+                    get_embedded_root_signature_subobject_rt_lib_conflict() : get_dummy_raygen_rt_lib(),
+                    ARRAY_SIZE(library_exports), library_exports);
+        }
+        rt_pso_factory_add_state_object_config(&factory,
+                D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
+        collection = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_COLLECTION);
+        ok(!!collection, "Failed to create deferred collection.\n");
+        if (!collection)
+            continue;
+
+        for (test = 0; test < ARRAY_SIZE(case_names); test++)
+        {
+            vkd3d_test_set_context("kind %u, %s", kind, case_names[test]);
+            count = test == 1 ? 2 : 1;
+            /* Allocate exactly NumExports entries. The selective case must not
+             * read the second slot while visiting deferred object B. */
+            imports = calloc(count, sizeof(*imports));
+            ok(!!imports, "Failed to allocate import array.\n");
+            if (!imports)
+                continue;
+            imports[0].Name = test == 2 ? u"Renamed" : names[kind][1];
+            imports[0].ExportToRename = test == 2 ? names[kind][1] : NULL;
+            if (test == 1)
+                imports[1].Name = names[kind][0];
+
+            rt_pso_factory_init(&factory);
+            rt_pso_factory_add_existing_collection(&factory, collection, count, imports);
+            rt_pso_factory_add_shader_config(&factory, 4, 4);
+            rt_pso_factory_add_pipeline_config(&factory, 1);
+            if (kind < 2)
+                rt_pso_factory_add_global_root_signature(&factory, rs);
+            if (kind != 0)
+            {
+                memset(library_exports, 0, sizeof(library_exports));
+                for (i = 0; i < count; i++)
+                {
+                    library_exports[i].Name = shader_names[i];
+                    library_exports[i].ExportToRename = kind >= 2 ? u"RayGen" : u"main";
+                }
+                rt_pso_factory_add_dxil_library(&factory, kind >= 2 ? get_embedded_subobject_dupe_rt_lib() :
+                        get_dummy_raygen_rt_lib(), count, library_exports);
+            }
+            if (kind >= 2)
+            {
+                /* Named associations make every selected embedded root
+                 * observable; an omitted B or A must fail pipeline linking. */
+                for (i = 0; i < count; i++)
+                    rt_pso_factory_add_dxil_subobject_to_exports_association(&factory,
+                            imports[i].Name, 1, (LPCWSTR *)&shader_names[i]);
+            }
+            rtpso = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+            ok(!!rtpso, "Failed to link requested deferred exports.\n");
+            if (rtpso)
+            {
+                ID3D12StateObject_QueryInterface(rtpso, &IID_ID3D12StateObjectProperties, (void **)&props);
+                for (i = 0; i < count; i++)
+                    ok(!!ID3D12StateObjectProperties_GetShaderIdentifier(props,
+                            kind >= 2 ? shader_names[i] : imports[i].Name),
+                            "Missing selected executable export %u.\n", i);
+                if (test != 1 && kind < 2)
+                    ok(!ID3D12StateObjectProperties_GetShaderIdentifier(props, names[kind][0]),
+                            "Unselected export A escaped the collection filter.\n");
+                if (test == 2 && kind < 2)
+                    ok(!ID3D12StateObjectProperties_GetShaderIdentifier(props, names[kind][1]),
+                            "Original export B survived its rename.\n");
+                ID3D12StateObjectProperties_Release(props);
+                ID3D12StateObject_Release(rtpso);
+            }
+            free(imports);
+        }
+        if (kind == 1)
+        {
+            ID3D12StateObject *intermediate;
+            D3D12_EXPORT_DESC renamed = {0};
+            WCHAR *temporary_name;
+
+            vkd3d_test_set_context("renamed hit-group deferred lifetime");
+            temporary_name = malloc(sizeof(u"PersistentRename"));
+            ok(!!temporary_name, "Failed to allocate temporary export name.\n");
+            if (temporary_name)
+            {
+                memcpy(temporary_name, u"PersistentRename", sizeof(u"PersistentRename"));
+                renamed.Name = temporary_name;
+                renamed.ExportToRename = names[kind][1];
+                rt_pso_factory_init(&factory);
+                rt_pso_factory_add_existing_collection(&factory, collection, 1, &renamed);
+                rt_pso_factory_add_state_object_config(&factory,
+                        D3D12_STATE_OBJECT_FLAG_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITIONS);
+                intermediate = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_COLLECTION);
+                ok(!!intermediate, "Failed to create renamed deferred collection.\n");
+                memset(temporary_name, 0xdd, sizeof(u"PersistentRename"));
+                free(temporary_name);
+                ID3D12StateObject_Release(collection);
+                collection = NULL;
+
+                if (intermediate)
+                {
+                    rt_pso_factory_init(&factory);
+                    rt_pso_factory_add_existing_collection(&factory, intermediate, 0, NULL);
+                    rt_pso_factory_add_shader_config(&factory, 4, 4);
+                    rt_pso_factory_add_pipeline_config(&factory, 1);
+                    rt_pso_factory_add_global_root_signature(&factory, rs);
+                    rt_pso_factory_add_dxil_library(&factory, get_dummy_raygen_rt_lib(), 0, NULL);
+                    rtpso = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+                    ID3D12StateObject_Release(intermediate);
+                    ok(!!rtpso, "Renamed collection did not retain its descriptor/name.\n");
+                    if (rtpso)
+                    {
+                        ID3D12StateObject_QueryInterface(rtpso, &IID_ID3D12StateObjectProperties, (void **)&props);
+                        ok(!!ID3D12StateObjectProperties_GetShaderIdentifier(props, u"PersistentRename"),
+                                "Renamed export disappeared after source lifetime ended.\n");
+                        ok(!ID3D12StateObjectProperties_GetShaderIdentifier(props, names[kind][1]),
+                                "Original export survived deferred rename.\n");
+                        ID3D12StateObjectProperties_Release(props);
+                        ID3D12StateObject_Release(rtpso);
+                    }
+                }
+            }
+        }
+        if (collection)
+            ID3D12StateObject_Release(collection);
+    }
+    {
+        D3D12_ROOT_PARAMETER params[2] = {{0}};
+        D3D12_EXPORT_DESC exports[2] = {{0}};
+        ID3D12RootSignature *rd_rs = NULL;
+
+        /* Engine-only RDAT hit-group rename: both the named subobject and the
+         * HitGroupExport payload must expose the new name. This does not test
+         * native Helios library translation, which receives no RDAT container. */
+        vkd3d_test_set_context("engine RDAT hit-group rename");
+        for (i = 0; i < ARRAY_SIZE(params); i++)
+        {
+            params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[i].Descriptor.ShaderRegister = 2 * i;
+        }
+        rs_desc.NumParameters = ARRAY_SIZE(params);
+        rs_desc.pParameters = params;
+        create_root_signature(context.context.device, &rs_desc, &rd_rs);
+        if (rd_rs)
+        {
+            exports[0].Name = u"RenamedHit";
+            exports[0].ExportToRename = u"thg";
+            exports[1].Name = u"RayClosestHit";
+            rt_pso_factory_init(&factory);
+            rt_pso_factory_add_dxil_library(&factory, get_embedded_subobject_rt_lib(), ARRAY_SIZE(exports), exports);
+            rt_pso_factory_add_dxil_library(&factory, get_dummy_raygen_rt_lib(), 0, NULL);
+            rt_pso_factory_add_shader_config(&factory, 4, 8);
+            rt_pso_factory_add_pipeline_config(&factory, 1);
+            rt_pso_factory_add_global_root_signature(&factory, rd_rs);
+            rtpso = rt_pso_factory_compile(&context, &factory, D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+            ok(!!rtpso, "Failed to compile renamed RDAT hit group.\n");
+            if (rtpso)
+            {
+                ID3D12StateObject_QueryInterface(rtpso, &IID_ID3D12StateObjectProperties, (void **)&props);
+                ok(!!ID3D12StateObjectProperties_GetShaderIdentifier(props, u"RenamedHit"),
+                        "Renamed RDAT hit-group identifier is missing.\n");
+                ok(!ID3D12StateObjectProperties_GetShaderIdentifier(props, u"thg"),
+                        "Original RDAT hit-group identifier survived its rename.\n");
+                ID3D12StateObjectProperties_Release(props);
+                ID3D12StateObject_Release(rtpso);
+            }
+            ID3D12RootSignature_Release(rd_rs);
+        }
+    }
+    vkd3d_test_set_context(NULL);
+    ID3D12RootSignature_Release(rs);
+    destroy_raytracing_test_context(&context);
+}
+
 void test_raytracing_deferred_compilation(void)
 {
     struct raytracing_test_context context;
@@ -4701,6 +4971,34 @@ void test_raytracing_opacity_micro_map(void)
     destroy_raytracing_test_context(&context);
 }
 
+void test_raytracing_postbuild_recording_failure(void)
+{
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC desc = {0};
+    D3D12_GPU_VIRTUAL_ADDRESS invalid_address = 0;
+    struct raytracing_test_context context;
+    ID3D12Resource *output;
+    HRESULT hr;
+
+    if (!init_raytracing_test_context(&context, D3D12_RAYTRACING_TIER_1_0))
+        return;
+    output = create_default_buffer(context.context.device, 16,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    desc.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE;
+    desc.DestBuffer = ID3D12Resource_GetGPUVirtualAddress(output);
+    /* Engine rejection contract. The invalid AS address must fail recording;
+     * no invalid GPU operation is submitted and this is not an OOM witness. */
+    ID3D12GraphicsCommandList4_EmitRaytracingAccelerationStructurePostbuildInfo(context.list4,
+            &desc, 1, &invalid_address);
+    hr = ID3D12GraphicsCommandList_Close(context.context.list);
+    ok(hr == E_INVALIDARG, "Invalid postbuild address closed with hr %#x.\n", (int)hr);
+    hr = ID3D12GraphicsCommandList_Reset(context.context.list, context.context.allocator, NULL);
+    ok(hr == E_INVALIDARG, "Reset lost failed AS Close, hr %#x.\n", (int)hr);
+    hr = ID3D12Device_GetDeviceRemovedReason(context.context.device);
+    ok(hr == S_OK, "Unsubmitted AS recording failure removed device, hr %#x.\n", (int)hr);
+    ID3D12Resource_Release(output);
+    destroy_raytracing_test_context(&context);
+}
+
 void test_raytracing_acceleration_structure_validation(void)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12;
@@ -5215,4 +5513,79 @@ void test_raytracing_collection_handle_invariance(void)
     ID3D12StateObject_Release(miss2);
     ID3D12DescriptorHeap_Release(heap);
     destroy_raytracing_test_context(&context);
+}
+
+/* Engine failure containment, not a portable D3D12 invalid-data contract. The
+ * public serialization header is produced by a GPU copy before DESERIALIZE;
+ * malformed metadata must remove the device without submitting the suffix. */
+void test_raytracing_serialization_rejection(void)
+{
+    D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER header;
+    const uint64_t markers[2] = {0, 0x1122334455667788ull};
+    struct raytracing_test_context context;
+    ID3D12Resource *source, *destination, *input, *output, *marker;
+    ID3D12Fence *fence;
+    uint64_t *mapped;
+    unsigned int i;
+    HANDLE event;
+    HRESULT hr;
+
+    for (i = 0; i < 5; i++)
+    {
+        if (!init_raytracing_test_context(&context, D3D12_RAYTRACING_TIER_1_0))
+            return;
+        memset(&header, 0, sizeof(header));
+        header.SerializedSizeInBytesIncludingHeader = sizeof(header);
+        header.DeserializedSizeInBytes = 256;
+        switch (i)
+        {
+            case 0: header.SerializedSizeInBytesIncludingHeader = 0; break;
+            case 1: header.SerializedSizeInBytesIncludingHeader = UINT64_MAX; break;
+            case 2: header.DeserializedSizeInBytes = UINT64_MAX; break;
+            case 3: header.NumBottomLevelAccelerationStructurePointersAfterHeader = UINT64_MAX; break;
+            default: break; /* Well-bounded header, incompatible producer UUID. */
+        }
+        source = create_default_buffer(context.context.device, 256, D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        destination = create_default_buffer(context.context.device, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+        input = create_upload_buffer(context.context.device, sizeof(header), &header);
+        marker = create_upload_buffer(context.context.device, sizeof(markers), markers);
+        output = create_readback_buffer(context.context.device, sizeof(markers));
+        ID3D12GraphicsCommandList_CopyBufferRegion(context.context.list, source, 0, input, 0, sizeof(header));
+        ID3D12GraphicsCommandList_CopyBufferRegion(context.context.list, output, 0, marker, 0, sizeof(markers));
+        transition_resource_state(context.context.list, source, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12GraphicsCommandList4_CopyRaytracingAccelerationStructure(context.list4,
+                ID3D12Resource_GetGPUVirtualAddress(destination), ID3D12Resource_GetGPUVirtualAddress(source),
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_DESERIALIZE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(context.context.list, output, 0, marker, sizeof(uint64_t), sizeof(uint64_t));
+        hr = ID3D12GraphicsCommandList_Close(context.context.list);
+        rtas_serialization_require(SUCCEEDED(hr), "GPU-only metadata not read at Close");
+        hr = ID3D12Device_CreateFence(context.context.device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence);
+        rtas_serialization_require(SUCCEEDED(hr), "create rejection fence");
+        event = create_event();
+        rtas_serialization_require(!!event, "create rejection event");
+        hr = ID3D12Fence_SetEventOnCompletion(fence, 1, event);
+        rtas_serialization_require(SUCCEEDED(hr), "register rejection fence");
+        ID3D12CommandQueue_ExecuteCommandLists(context.context.queue, 1, (ID3D12CommandList **)&context.context.list);
+        hr = ID3D12CommandQueue_Signal(context.context.queue, fence, 1);
+        rtas_serialization_require(SUCCEEDED(hr), "enqueue rejection fence");
+        rtas_serialization_require(wait_event(event, 30000) == 0, "rejection completes without GPU hang");
+        hr = ID3D12Device_GetDeviceRemovedReason(context.context.device);
+        ok(hr == E_INVALIDARG, "Malformed serialized header %u removed with %#x.\n", i, (unsigned int)hr);
+        hr = ID3D12Resource_Map(output, 0, NULL, (void **)&mapped);
+        rtas_serialization_require(SUCCEEDED(hr), "map rejection prefix receipt");
+        ok(mapped[0] == 0 && mapped[1] == markers[1], "Rejected restore %u executed its suffix or lost its prefix.\n", i);
+        ID3D12Resource_Unmap(output, 0, NULL);
+        trace("RTAS_REJECTION,case=%u,prefix_present,suffix_absent\n", i);
+        destroy_event(event);
+        ID3D12Fence_Release(fence);
+        ID3D12Resource_Release(output);
+        ID3D12Resource_Release(marker);
+        ID3D12Resource_Release(input);
+        ID3D12Resource_Release(source);
+        ID3D12Resource_Release(destination);
+        destroy_raytracing_test_context(&context);
+    }
 }

@@ -21,6 +21,7 @@
 
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
 #include "d3d12_crosstest.h"
+#include "d3d12_dgc_query.h"
 
 void test_create_query_heap(void)
 {
@@ -302,6 +303,418 @@ void test_query_pipeline_statistics(void)
     release_resource_readback(&rb);
     ID3D12QueryHeap_Release(query_heap);
     ID3D12Resource_Release(resource);
+    destroy_test_context(&context);
+}
+
+static void test_query_pipeline_statistics_continuation_internal(bool ia)
+{
+    D3D12_QUERY_DATA_PIPELINE_STATISTICS *results;
+    D3D12_ROOT_PARAMETER parameters[2] = {{0}};
+    D3D12_ROOT_SIGNATURE_DESC root_desc = {0};
+    D3D12_QUERY_HEAP_DESC heap_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 4, 0};
+    D3D12_RANGE no_read = {0, 0};
+    D3D12_RANGE read_range = {0, 4 * sizeof(*results)};
+    uint32_t arguments[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 2};
+    const uint32_t root_arguments[] = {0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1};
+    const uint64_t zero_predicate = 0;
+    D3D12_INDIRECT_ARGUMENT_DESC signature_arguments[2] = {{0}};
+    D3D12_COMMAND_SIGNATURE_DESC signature_desc = {16, 2, signature_arguments, 0};
+    ID3D12RootSignature *compute_root;
+    ID3D12PipelineState *compute_pso;
+    ID3D12CommandSignature *signature, *root_signature;
+    ID3D12Resource *indirect, *root_indirect, *predicate, *output, *readback;
+    ID3D12QueryHeap *heap;
+    ID3D12CommandSignature *ia_signature = NULL;
+    ID3D12Resource *ia_arguments = NULL;
+    ID3D12CommandAllocator *reset_allocator = NULL;
+    ID3D12CommandQueue *release_queue = NULL;
+    ID3D12Fence *blocker = NULL, *completion = NULL;
+    HANDLE completion_event = NULL;
+    D3D12_INDIRECT_ARGUMENT_DESC ia_tokens[2] = {{0}};
+    D3D12_COMMAND_SIGNATURE_DESC ia_desc = {32, 2, ia_tokens, 0};
+    const uint32_t ia_data[16] = {0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 6, 1, 0, 0};
+    struct test_context context;
+    uint32_t *mapped;
+    unsigned int iteration, i;
+    HRESULT hr;
+
+#include "shaders/command/headers/execute_indirect_tier11_dispatch.h"
+
+    if (!init_test_context(&context, NULL))
+        return;
+
+    hr = ID3D12Device_CreateQueryHeap(context.device, &heap_desc, &IID_ID3D12QueryHeap, (void **)&heap);
+    ok(hr == S_OK, "CreateQueryHeap failed, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        destroy_test_context(&context);
+        return;
+    }
+
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].Constants.Num32BitValues = 1;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    root_desc.NumParameters = ARRAY_SIZE(parameters);
+    root_desc.pParameters = parameters;
+    hr = create_root_signature(context.device, &root_desc, &compute_root);
+    ok(hr == S_OK, "CreateRootSignature failed, hr %#x.\n", (int)hr);
+    compute_pso = create_compute_pipeline_state(context.device, compute_root, execute_indirect_tier11_dispatch_dxbc);
+    signature = create_command_signature(context.device, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+    signature_arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    signature_arguments[0].Constant.RootParameterIndex = 1;
+    signature_arguments[0].Constant.Num32BitValuesToSet = 1;
+    signature_arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    hr = ID3D12Device_CreateCommandSignature(context.device, &signature_desc, compute_root,
+            &IID_ID3D12CommandSignature, (void **)&root_signature);
+    ok(hr == S_OK, "CreateCommandSignature failed, hr %#x.\n", (int)hr);
+    if (FAILED(hr))
+    {
+        ID3D12CommandSignature_Release(signature);
+        ID3D12PipelineState_Release(compute_pso);
+        ID3D12RootSignature_Release(compute_root);
+        ID3D12QueryHeap_Release(heap);
+        destroy_test_context(&context);
+        return;
+    }
+    if (ia)
+    {
+        ia_tokens[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+        ia_tokens[0].VertexBuffer.Slot = 31;
+        ia_tokens[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        hr = ID3D12Device_CreateCommandSignature(context.device, &ia_desc, NULL,
+                &IID_ID3D12CommandSignature, (void **)&ia_signature);
+        assert_that(hr == S_OK, "IA query signature failed, hr %#x.\n", (int)hr);
+        ia_arguments = create_upload_buffer(context.device, sizeof(ia_data), ia_data);
+        release_queue = create_command_queue(context.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_QUEUE_PRIORITY_NORMAL);
+        hr = ID3D12Device_CreateCommandAllocator(context.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&reset_allocator);
+        assert_that(hr == S_OK, "Create reset allocator failed, hr %#x.\n", (int)hr);
+        hr = ID3D12Device_CreateFence(context.device, 0, 0, &IID_ID3D12Fence, (void **)&blocker);
+        assert_that(hr == S_OK, "Create blocker failed, hr %#x.\n", (int)hr);
+        hr = ID3D12Device_CreateFence(context.device, 0, 0, &IID_ID3D12Fence, (void **)&completion);
+        assert_that(hr == S_OK, "Create completion failed, hr %#x.\n", (int)hr);
+        completion_event = create_event();
+        assert_that(!!completion_event, "Create completion event failed.\n");
+    }
+    indirect = create_upload_buffer(context.device, sizeof(arguments), arguments);
+    root_indirect = create_upload_buffer(context.device, sizeof(root_arguments), root_arguments);
+    predicate = create_upload_buffer(context.device, sizeof(zero_predicate), &zero_predicate);
+    output = create_default_buffer(context.device, 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    readback = create_readback_buffer(context.device, read_range.End);
+
+    ID3D12GraphicsCommandList_OMSetRenderTargets(context.list, 1, &context.rtv, false, NULL);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_RSSetViewports(context.list, 1, &context.viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1, &context.scissor_rect);
+
+    ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+    if (ia)
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list, ia_signature, 1, ia_arguments, 0, NULL, 0);
+    else
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+    if (ia)
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list, ia_signature, 1, ia_arguments, 0, NULL, 0);
+    else
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+    /* Gathering B invokes internal compute while A is still logically active. */
+    ID3D12GraphicsCommandList_SetPredication(context.list, predicate, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            1, 1, readback, sizeof(*results));
+    ID3D12GraphicsCommandList_SetPredication(context.list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+    ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+
+    ID3D12GraphicsCommandList_SetComputeRootSignature(context.list, compute_root);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, compute_pso);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(context.list, 0,
+            ID3D12Resource_GetGPUVirtualAddress(output));
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstant(context.list, 1, 0, 0);
+    ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+    uav_barrier(context.list, output);
+    /* Both action-only and root-state preprocessing must stay out of stats. */
+    ID3D12GraphicsCommandList_ExecuteIndirect(context.list, signature, 3, indirect, 0, indirect, 9 * sizeof(uint32_t));
+    uav_barrier(context.list, output);
+    ID3D12GraphicsCommandList_ExecuteIndirect(context.list, root_signature, 3,
+            root_indirect, 0, indirect, 9 * sizeof(uint32_t));
+    uav_barrier(context.list, output);
+    ID3D12GraphicsCommandList_Dispatch(context.list, 1, 1, 1);
+    uav_barrier(context.list, output);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    if (ia)
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list, ia_signature, 1, ia_arguments, 0, NULL, 0);
+    else
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            0, 1, readback, 0);
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            2, 1, readback, 2 * sizeof(*results));
+
+    /* The first scope is intentionally not resolved before index reuse. */
+    ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 3);
+    if (ia)
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list, ia_signature, 1, ia_arguments, 0, NULL, 0);
+    else
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+    ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 3);
+    ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 3);
+    if (ia)
+        ID3D12GraphicsCommandList_ExecuteIndirect(context.list, ia_signature, 1, ia_arguments, 32, NULL, 0);
+    else
+    ID3D12GraphicsCommandList_DrawInstanced(context.list, 6, 1, 0, 0);
+    ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 3);
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            3, 1, readback, 3 * sizeof(*results));
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(hr == S_OK, "Close failed, hr %#x.\n", (int)hr);
+
+    for (iteration = 0; SUCCEEDED(hr) && iteration < 3; iteration++)
+    {
+        /* Replay the exact closed list with different data, including a zero
+         * count. Physical query resets must execute again each time. */
+        hr = ID3D12Resource_Map(indirect, 0, &no_read, (void **)&mapped);
+        ok(hr == S_OK, "Map arguments failed, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            break;
+        mapped[9] = 2 - iteration;
+        ID3D12Resource_Unmap(indirect, 0, NULL);
+        if (ia && iteration == 2)
+        {
+            /* Reset the public list while its immutable recording is held
+             * behind a queue wait. Another queue supplies the dependency. */
+            hr = ID3D12CommandQueue_Wait(context.queue, blocker, 1);
+            ok(hr == S_OK, "Queue wait failed, hr %#x.\n", (int)hr);
+            exec_command_list(context.queue, context.list);
+            hr = ID3D12CommandQueue_Signal(context.queue, completion, 1);
+            ok(hr == S_OK, "Completion signal failed, hr %#x.\n", (int)hr);
+            hr = ID3D12Fence_SetEventOnCompletion(completion, 1, completion_event);
+            ok(hr == S_OK, "Completion event failed, hr %#x.\n", (int)hr);
+            ok(wait_event(completion_event, 20) == WAIT_TIMEOUT,
+                    "Execution completed before its queue wait was released.\n");
+            hr = ID3D12GraphicsCommandList_Reset(context.list, reset_allocator, NULL);
+            ok(hr == S_OK, "Reset pending public list failed, hr %#x.\n", (int)hr);
+            hr = ID3D12GraphicsCommandList_Close(context.list);
+            ok(hr == S_OK, "Close reset list failed, hr %#x.\n", (int)hr);
+            exec_command_list(release_queue, context.list);
+            hr = ID3D12CommandQueue_Signal(release_queue, blocker, 1);
+            ok(hr == S_OK, "Releasing queue wait failed, hr %#x.\n", (int)hr);
+            ok(wait_event(completion_event, 5000) == WAIT_OBJECT_0,
+                    "IA execution did not complete after releasing its queue wait.\n");
+        }
+        else
+            exec_command_list(context.queue, context.list);
+        wait_queue_idle(context.device, context.queue);
+        hr = ID3D12Resource_Map(readback, 0, &read_range, (void **)&results);
+        ok(hr == S_OK, "Map results failed, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            break;
+
+        for (i = 0; i < 4; i++)
+        {
+            const uint64_t *fields = (const uint64_t *)&results[i];
+            uint64_t expected_vertices = i == 0 ? 9 : i == 1 ? 3 : i == 2 ? 0 : 6;
+            unsigned int j;
+            ok(results[i].IAVertices == expected_vertices, "Replay %u, query %u: IA vertices %"PRIu64" != %"PRIu64".\n",
+                    iteration, i, results[i].IAVertices, expected_vertices);
+            ok(results[i].IAPrimitives == expected_vertices / 3, "Replay %u, query %u: IA primitives %"PRIu64".\n",
+                    iteration, i, results[i].IAPrimitives);
+            ok(results[i].VSInvocations == expected_vertices, "Replay %u, query %u: VS invocations %"PRIu64".\n",
+                    iteration, i, results[i].VSInvocations);
+            ok(results[i].CSInvocations == (i == 0 ? 6 - 2 * iteration : 0),
+                    "Replay %u, query %u: CS invocations %"PRIu64".\n", iteration, i, results[i].CSInvocations);
+            ok(!results[i].GSPrimitives && !results[i].HSInvocations && !results[i].DSInvocations,
+                    "Replay %u, query %u: inactive shader stages contributed.\n", iteration, i);
+            if (i == 2)
+                for (j = 0; j < sizeof(*results) / sizeof(uint64_t); j++)
+                    ok(!fields[j], "Replay %u: empty query field %u is %"PRIu64".\n", iteration, j, fields[j]);
+            else
+                ok(results[i].PSInvocations && results[i].CInvocations && results[i].CPrimitives,
+                        "Replay %u, query %u: missing rasterization statistics.\n", iteration, i);
+        }
+        ID3D12Resource_Unmap(readback, 0, &no_read);
+    }
+
+    if (completion_event)
+        destroy_event(completion_event);
+    if (completion)
+        ID3D12Fence_Release(completion);
+    if (blocker)
+        ID3D12Fence_Release(blocker);
+    if (release_queue)
+        ID3D12CommandQueue_Release(release_queue);
+    if (reset_allocator)
+        ID3D12CommandAllocator_Release(reset_allocator);
+    if (ia_arguments)
+        ID3D12Resource_Release(ia_arguments);
+    if (ia_signature)
+        ID3D12CommandSignature_Release(ia_signature);
+    ID3D12Resource_Release(readback);
+    ID3D12Resource_Release(output);
+    ID3D12Resource_Release(indirect);
+    ID3D12Resource_Release(root_indirect);
+    ID3D12Resource_Release(predicate);
+    ID3D12CommandSignature_Release(signature);
+    ID3D12CommandSignature_Release(root_signature);
+    ID3D12PipelineState_Release(compute_pso);
+    ID3D12RootSignature_Release(compute_root);
+    ID3D12QueryHeap_Release(heap);
+    destroy_test_context(&context);
+}
+
+void test_query_pipeline_statistics_continuation(void)
+{
+    test_query_pipeline_statistics_continuation_internal(false);
+}
+
+void test_query_pipeline_statistics_continuation_ia(void)
+{
+    test_query_pipeline_statistics_continuation_internal(true);
+}
+
+void test_query_pipeline_statistics_multiview(void)
+{
+    static const D3D12_VIEW_INSTANCE_LOCATION locations[] = {{0, 0}, {0, 1}, {0, 2}, {0, 3}};
+    D3D12_QUERY_HEAP_DESC heap_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 97, 0};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options = {0};
+    D3D12_QUERY_DATA_PIPELINE_STATISTICS *results;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
+    struct test_context_desc context_desc = {0};
+    struct test_context context;
+    ID3D12GraphicsCommandList1 *list1;
+    ID3D12Device2 *device2;
+    ID3D12QueryHeap *heap;
+    ID3D12Resource *readback;
+    D3D12_RANGE no_read = {0, 0};
+    D3D12_RANGE read_range = {0, 97 * sizeof(*results)};
+    unsigned int i, replay;
+    HRESULT hr;
+    struct
+    {
+        union d3d12_root_signature_subobject root;
+        union d3d12_shader_bytecode_subobject vs, ps;
+        union d3d12_rasterizer_subobject rasterizer;
+        union d3d12_blend_subobject blend;
+        union d3d12_depth_stencil_subobject depth;
+        union d3d12_render_target_formats_subobject targets;
+        union d3d12_sample_desc_subobject samples;
+        union d3d12_sample_mask_subobject sample_mask;
+        union d3d12_primitive_topology_subobject topology;
+        union d3d12_view_instancing_subobject views;
+    } stream = {0};
+
+#include "shaders/pso/headers/vs_view_id_passthrough.h"
+#include "shaders/pso/headers/ps_view_id_passthrough.h"
+
+    context_desc.no_pipeline = true;
+    context_desc.rt_format = DXGI_FORMAT_R32_UINT;
+    context_desc.rt_array_size = 4;
+    if (!init_test_context(&context, &context_desc))
+        return;
+    ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
+    if (!options.ViewInstancingTier || !context_supports_dxil(&context))
+    {
+        skip("View instancing and DXIL are required.\n");
+        destroy_test_context(&context);
+        return;
+    }
+    hr = ID3D12Device_QueryInterface(context.device, &IID_ID3D12Device2, (void **)&device2);
+    ok(hr == S_OK, "Device2 unavailable, hr %#x.\n", (int)hr);
+    hr = ID3D12GraphicsCommandList_QueryInterface(context.list, &IID_ID3D12GraphicsCommandList1, (void **)&list1);
+    ok(hr == S_OK, "CommandList1 unavailable, hr %#x.\n", (int)hr);
+    init_pipeline_state_desc_dxil(&pso_desc, context.root_signature, context_desc.rt_format,
+            &vs_view_id_passthrough_dxil, &ps_view_id_passthrough_dxil, NULL);
+    stream.root.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    stream.root.root_signature = context.root_signature;
+    stream.vs.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+    stream.vs.shader_bytecode = pso_desc.VS;
+    stream.ps.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+    stream.ps.shader_bytecode = pso_desc.PS;
+    stream.rasterizer.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+    stream.rasterizer.rasterizer_desc = pso_desc.RasterizerState;
+    stream.blend.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;
+    stream.blend.blend_desc = pso_desc.BlendState;
+    stream.depth.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+    stream.depth.depth_stencil_desc = pso_desc.DepthStencilState;
+    stream.targets.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    stream.targets.render_target_formats.NumRenderTargets = 1;
+    stream.targets.render_target_formats.RTFormats[0] = context_desc.rt_format;
+    stream.samples.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;
+    stream.samples.sample_desc = pso_desc.SampleDesc;
+    stream.sample_mask.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK;
+    stream.sample_mask.sample_mask = pso_desc.SampleMask;
+    stream.topology.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    stream.topology.primitive_topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    stream.views.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING;
+    stream.views.view_instancing_desc.ViewInstanceCount = ARRAY_SIZE(locations);
+    stream.views.view_instancing_desc.pViewInstanceLocations = locations;
+    stream.views.view_instancing_desc.Flags = D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING;
+    hr = create_pipeline_state_from_stream(device2, &stream, &context.pipeline_state);
+    ok(hr == S_OK, "CreatePipelineState failed, hr %#x.\n", (int)hr);
+    ID3D12Device2_Release(device2);
+    if (FAILED(hr))
+    {
+        ID3D12GraphicsCommandList1_Release(list1);
+        destroy_test_context(&context);
+        return;
+    }
+    hr = ID3D12Device_CreateQueryHeap(context.device, &heap_desc, &IID_ID3D12QueryHeap, (void **)&heap);
+    ok(hr == S_OK, "CreateQueryHeap failed, hr %#x.\n", (int)hr);
+    readback = create_readback_buffer(context.device, read_range.End);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(context.list, 1, &context.rtv, false, NULL);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
+    ID3D12GraphicsCommandList_SetPipelineState(context.list, context.pipeline_state);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_RSSetViewports(context.list, 1, &context.viewport);
+    ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1, &context.scissor_rect);
+
+    /* Uneven fragments cross a 128-slot physical pool boundary. Change view
+     * masks inside each logical query, then replay the entire closed list. */
+    for (i = 0; i < heap_desc.Count; i++)
+    {
+        ID3D12GraphicsCommandList1_SetViewInstanceMask(list1, 1);
+        ID3D12GraphicsCommandList_BeginQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
+        ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+        ID3D12GraphicsCommandList1_SetViewInstanceMask(list1, 0xb);
+        ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
+        ID3D12GraphicsCommandList_EndQuery(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, i);
+    }
+    ID3D12GraphicsCommandList_ResolveQueryData(context.list, heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
+            0, heap_desc.Count, readback, 0);
+    hr = ID3D12GraphicsCommandList_Close(context.list);
+    ok(hr == S_OK, "Close failed, hr %#x.\n", (int)hr);
+    for (replay = 0; SUCCEEDED(hr) && replay < 2; replay++)
+    {
+        exec_command_list(context.queue, context.list);
+        wait_queue_idle(context.device, context.queue);
+        hr = ID3D12Resource_Map(readback, 0, &read_range, (void **)&results);
+        ok(hr == S_OK, "Map failed, hr %#x.\n", (int)hr);
+        if (FAILED(hr))
+            break;
+        for (i = 0; i < heap_desc.Count; i++)
+        {
+            /* SV_ViewID is first used by VS. At tier 2 the IA can either
+             * share or repeat work; VS and later include every view. */
+            ok(results[i].IAVertices >= 6 && results[i].IAVertices <= 12,
+                    "Replay %u query %u: IA vertices %"PRIu64".\n", replay, i, results[i].IAVertices);
+            ok(results[i].VSInvocations >= 12 && results[i].CPrimitives == 4 && results[i].PSInvocations,
+                    "Replay %u query %u: VS %"PRIu64", clipped primitives %"PRIu64", PS %"PRIu64".\n",
+                    replay, i, results[i].VSInvocations, results[i].CPrimitives, results[i].PSInvocations);
+            ok(!results[i].CSInvocations, "Replay %u query %u: internal CS counted %"PRIu64".\n",
+                    replay, i, results[i].CSInvocations);
+        }
+        ID3D12Resource_Unmap(readback, 0, &no_read);
+    }
+    ID3D12Resource_Release(readback);
+    ID3D12QueryHeap_Release(heap);
+    ID3D12GraphicsCommandList1_Release(list1);
     destroy_test_context(&context);
 }
 

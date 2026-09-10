@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// Native DGC executes the application shader. This pass supplies D3D12
+// CSInvocations from the same GPU dispatch stream; it does not execute or
+// emulate indirect commands. No 64-bit arithmetic/atomic feature is required.
+layout(local_size_x = 64) in;
+layout(std430, buffer_reference, buffer_reference_align = 4)
+readonly buffer words_t { uint words[]; };
+layout(std430, buffer_reference, buffer_reference_align = 8)
+writeonly buffer queries_t { uvec2 fields[]; };
+layout(push_constant) uniform args_t {
+  queries_t dst;
+  words_t arguments;
+  words_t count;
+  words_t predicate;
+  uint max_count;
+  uint stride;
+  uint group_threads;
+};
+shared uvec2 sums[64];
+
+uvec2 add64(uvec2 a, uvec2 b) {
+  uint carry;
+  uint lo = uaddCarry(a.x, b.x, carry);
+  return uvec2(lo, a.y + b.y + carry);
+}
+uvec2 mul64(uvec2 a, uint b) {
+  uint hi, lo;
+  umulExtended(a.x, b, hi, lo);
+  return uvec2(lo, hi + a.y * b);
+}
+
+void main() {
+  uint n = max_count;
+  if (any(notEqual(uvec2(count), uvec2(0))))
+    n = min(n, count.words[0]);
+  if (any(notEqual(uvec2(predicate), uvec2(0))))
+    if (predicate.words[0] == 0)
+      n = 0;
+
+  uint lane = gl_LocalInvocationID.x;
+  uint step = gl_NumWorkGroups.x * 64;
+  uvec2 total = uvec2(0);
+  for (uint i = gl_GlobalInvocationID.x; i < n;) {
+    // Byte addressing must not wrap at 4 GiB on a large, padded stream.
+    words_t dispatch = words_t(add64(uvec2(arguments), mul64(uvec2(i, 0), stride)));
+    uvec2 invocations = mul64(uvec2(dispatch.words[0], 0), dispatch.words[1]);
+    invocations = mul64(invocations, dispatch.words[2]);
+    total = add64(total, mul64(invocations, group_threads));
+    if (n - i <= step)
+      break;
+    i += step;
+  }
+  sums[lane] = total;
+  barrier();
+  for (uint width = 32; width != 0; width >>= 1) {
+    if (lane < width)
+      sums[lane] = add64(sums[lane], sums[lane + width]);
+    barrier();
+  }
+  // Every replay writes all fields, including suppressed/zero-count work.
+  if (lane < 11)
+    dst.fields[gl_WorkGroupID.x * 11 + lane] = lane == 10 ? sums[0] : uvec2(0);
+}

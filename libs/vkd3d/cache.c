@@ -2640,6 +2640,9 @@ void vkd3d_pipeline_cache_compat_from_state_desc(struct vkd3d_pipeline_cache_com
 #define HS(v) state_hash = hash_fnv1_iterate_string(state_hash, v)
     if (!desc->cs.BytecodeLength)
     {
+        /* Hash both modes, invalidating older public PSOs that interpreted a
+         * legal semantic name as the private native-DDI register convention. */
+        H32(desc->helios_so_registers);
         H32(desc->stream_output.RasterizedStream);
         H32(desc->stream_output.NumEntries);
         H32(desc->stream_output.NumStrides);

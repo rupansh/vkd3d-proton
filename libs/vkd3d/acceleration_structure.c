@@ -191,7 +191,8 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
         have_aabbs = false;
 
         /* Don't hoist this memset since top-level geometries forces NumDescs == 1 assumption. */
-        memset(geometry_infos, 0, sizeof(*geometry_infos) * desc->NumDescs);
+        if (desc->NumDescs)
+            memset(geometry_infos, 0, sizeof(*geometry_infos) * desc->NumDescs);
         if (omm_triangles_infos)
             memset(omm_triangles_infos, 0, sizeof(*omm_triangles_infos) * desc->NumDescs);
         if (primitive_counts)
@@ -322,6 +323,16 @@ static void vkd3d_acceleration_structure_end_barrier(struct d3d12_command_list *
     VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep_info));
 }
 
+static void vkd3d_acceleration_structure_recording_error(struct d3d12_command_list *list,
+        HRESULT hr, const char *reason)
+{
+    /* Close preserves this failure HRESULT, which the native UMD reports
+     * through its command-list error callback and refusal counter.
+     * A diagnostic plus fabricated zero data is not an implementation. */
+    ERR("Acceleration-structure recording failed: %s.\n", reason);
+    d3d12_command_list_record_error(list, hr);
+}
+
 void vkd3d_acceleration_structure_write_postbuild_info(
         struct d3d12_command_list *list,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc,
@@ -338,17 +349,27 @@ void vkd3d_acceleration_structure_write_postbuild_info(
     uint32_t vk_query_index;
     uint32_t type_index;
     VkBuffer vk_buffer;
-    uint32_t offset;
+    VkDeviceSize offset, output_size;
+    HRESULT hr;
 
+    RT_TRACE("Postbuild type %u for AS %#"PRIx64".\n", desc->InfoType, va);
     resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, desc->DestBuffer);
     if (!resource)
     {
-        ERR("Invalid resource.\n");
+        vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "invalid postbuild destination");
         return;
     }
 
     vk_buffer = resource->vk_buffer;
     offset = desc->DestBuffer - resource->va;
+    output_size = desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION ?
+            2 * sizeof(uint64_t) : sizeof(uint64_t);
+    if (offset > resource->size || desc_offset > resource->size - offset ||
+            output_size > resource->size - offset - desc_offset || ((offset + desc_offset) & 7))
+    {
+        vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "postbuild output exceeds destination allocation");
+        return;
+    }
     offset += desc_offset;
 
     if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE)
@@ -360,8 +381,7 @@ void vkd3d_acceleration_structure_write_postbuild_info(
     {
         if (!list->device->device_info.ray_tracing_maintenance1_features.rayTracingMaintenance1)
         {
-            FIXME("CURRENT_SIZE postbuild requires VK_KHR_acceleration_structure_maintenance1.\n");
-            VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset, sizeof(uint64_t), 0));
+            vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "CURRENT_SIZE requires rayTracingMaintenance1");
             return;
         }
         vk_query_type = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR;
@@ -369,21 +389,24 @@ void vkd3d_acceleration_structure_write_postbuild_info(
     }
     else if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION)
     {
-        vk_query_type = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR;
-        type_index = VKD3D_QUERY_TYPE_INDEX_RT_SERIALIZE_SIZE;
+        /* A recorded type is not an execution-time fact: an earlier closed
+         * list may run after a later-recorded deserialize, alias or rebuild.
+         * Use the current serialized header for every ordinary-AS query. */
+        if (FAILED(hr = d3d12_command_list_prepare_rtas_metadata(list,
+                desc->DestBuffer + desc_offset, va, VKD3D_RTAS_METADATA_SERIALIZATION_QUERY)))
+            vkd3d_acceleration_structure_recording_error(list, hr, "serialization query continuation allocation failed");
+        return;
     }
     else
     {
-        FIXME("Unsupported InfoType %u.\n", desc->InfoType);
-        VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset,
-                sizeof(uint64_t), 0));
+        vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "unsupported postbuild information type");
         return;
     }
 
-    if (!d3d12_command_allocator_allocate_query_from_type_index(list->allocator,
-            type_index, &vk_query_pool, &vk_query_index))
+    if (FAILED(hr = d3d12_command_allocator_allocate_query_from_type_index(list->allocator,
+            type_index, &vk_query_pool, &vk_query_index)))
     {
-        ERR("Failed to allocate query.\n");
+        vkd3d_acceleration_structure_recording_error(list, hr, "postbuild query allocation failed");
         return;
     }
 
@@ -394,63 +417,6 @@ void vkd3d_acceleration_structure_write_postbuild_info(
             vk_buffer, offset, stride,
             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
 
-    if (desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION)
-    {
-        /* FIXME: The current Vulkan spec makes it a VUID to use BLP on BLAS / OMM-Array. We try to avoid this where
-         * possible but it isn't always possible. Some drivers such as NVIDIA will work correctly even under the VUID
-         * violation */
-        bool is_tlas;
-
-        if (rtas_kind == VKD3D_RTAS_KIND_TLAS)
-            is_tlas = true;
-        else if (rtas_kind == VKD3D_RTAS_KIND_NON_TLAS)
-            is_tlas = false;
-        else /* if(rtas_kind == VKD3D_RTAS_KIND_UNKNOWN || rtas_kind == VKD3D_RTAS_KIND_MUTATED) */
-        {
-            if (VKD3D_CONFIG_FLAG_IS_SET(ZERO_FILL_BLP))
-            {
-                FIXME("Do not know the state of VA #%"PRIx64" (%s) assuming non-TLAS\n",
-                        va, vkd3d_get_rtas_kind_string(rtas_kind));
-                is_tlas = false;
-            }
-            else
-            {
-                FIXME("Do not know the state of VA #%"PRIx64" (%s) assuming TLAS\n",
-                        va, vkd3d_get_rtas_kind_string(rtas_kind));
-                is_tlas = true;
-            }
-        }
-
-        if (!is_tlas)
-        {
-            VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset + sizeof(uint64_t),
-                    sizeof(uint64_t), 0));
-        }
-        else if (list->device->device_info.ray_tracing_maintenance1_features.rayTracingMaintenance1)
-        {
-            type_index = VKD3D_QUERY_TYPE_INDEX_RT_SERIALIZE_SIZE_BOTTOM_LEVEL_POINTERS;
-            if (!d3d12_command_allocator_allocate_query_from_type_index(list->allocator,
-                    type_index, &vk_query_pool, &vk_query_index))
-            {
-                ERR("Failed to allocate query.\n");
-                return;
-            }
-
-            VK_CALL(vkCmdWriteAccelerationStructuresPropertiesKHR(list->cmd.vk_command_buffer,
-                    1, &vk_acceleration_structure, VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR,
-                    vk_query_pool, vk_query_index));
-            VK_CALL(vkCmdCopyQueryPoolResults(list->cmd.vk_command_buffer,
-                    vk_query_pool, vk_query_index, 1,
-                    vk_buffer, offset + sizeof(uint64_t), stride,
-                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-        }
-        else
-        {
-            FIXME("NumBottomLevelPointers will always return 0 (VK_KHR_acceleration_structure_maintenance1 not present).\n");
-            VK_CALL(vkCmdFillBuffer(list->cmd.vk_command_buffer, vk_buffer, offset + sizeof(uint64_t),
-                    sizeof(uint64_t), 0));
-        }
-    }
 }
 
 void vkd3d_acceleration_structure_emit_postbuild_info(
@@ -465,6 +431,7 @@ void vkd3d_acceleration_structure_emit_postbuild_info(
     VkDependencyInfo dep_info;
     VkMemoryBarrier2 barrier;
     VkDeviceSize stride;
+    unsigned int alignment;
     uint32_t i;
 
     /* We resolve the query in TRANSFER, but DXR expects UNORDERED_ACCESS. */
@@ -483,15 +450,23 @@ void vkd3d_acceleration_structure_emit_postbuild_info(
 
     stride = desc->InfoType == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION ?
             2 * sizeof(uint64_t) : sizeof(uint64_t);
+    alignment = list->device->device_info.supports_opacity_micromap ?
+            D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_BYTE_ALIGNMENT :
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
 
     for (i = 0; i < count; i++)
     {
+        if (!addresses[i] || (addresses[i] & (alignment - 1)))
+        {
+            vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "unaligned or null postbuild source");
+            break;
+        }
         vkd3d_va_map_try_read_rtas(&list->device->memory_allocator.va_map, list->device, addresses[i],
                 &vk_acceleration_structure, &rtas_kind);
 
         if (vk_acceleration_structure == VK_NULL_HANDLE)
         {
-            WARN("Emit postbuild placing unknown AS at #%" PRIx64 " future BLP queries may not be reliable.\n",
+            WARN("Emit postbuild placing unknown AS at #%" PRIx64 " for an execution-time query.\n",
                     addresses[i]);
             rtas_kind = VKD3D_RTAS_KIND_UNKNOWN;
             vk_acceleration_structure =
@@ -500,8 +475,8 @@ void vkd3d_acceleration_structure_emit_postbuild_info(
         }
         if (vk_acceleration_structure == VK_NULL_HANDLE)
         {
-            ERR("Invalid VA #%"PRIx64" for emit postbuild.\n", addresses[i]);
-            continue;
+            vkd3d_acceleration_structure_recording_error(list, E_INVALIDARG, "invalid source address for postbuild information");
+            break;
         }
 
         vkd3d_acceleration_structure_write_postbuild_info(list, desc, i * stride, vk_acceleration_structure,
@@ -569,34 +544,122 @@ static bool convert_copy_mode(
     }
 }
 
-void vkd3d_acceleration_structure_copy(
+/* Vulkan and DXR ordinary AS serialization use the same header and bottom-level
+ * address postamble: a 32-byte producer/version identifier, serialized size,
+ * deserialized size, and count followed by tightly packed 64-bit BLAS addresses.
+ * The application may produce or relocate this data on the GPU. The queue's
+ * deserialization continuation snapshots it only after the preceding GPU work,
+ * creating referenced BLAS views before submitting the restore command.
+ * vkd3d's AS-view contract requires AS addresses to equal buffer GPUVAs.
+ * OMM block serialization is outside this native DDI's geometry surface. */
+static bool vkd3d_acceleration_structure_serialized_address_valid(
+        struct d3d12_command_list *list, D3D12_GPU_VIRTUAL_ADDRESS address)
+{
+    const struct vkd3d_unique_resource *resource;
+    VkDeviceSize offset;
+
+    if (!address || (address & (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT - 1)))
+        return false;
+    resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, address);
+    if (!resource || !resource->va || address < resource->va)
+        return false;
+    offset = address - resource->va;
+    return offset <= resource->size &&
+            resource->size - offset >= sizeof(D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE_HEADER);
+}
+
+bool vkd3d_acceleration_structure_deserialize(struct d3d12_command_list *list,
+        D3D12_GPU_VIRTUAL_ADDRESS dst, D3D12_GPU_VIRTUAL_ADDRESS src)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkCopyMemoryToAccelerationStructureInfoKHR info;
+    VkAccelerationStructureKHR dst_as;
+    HRESULT hr;
+
+    if (!vk_procs->vkCmdCopyMemoryToAccelerationStructureKHR ||
+            !vkd3d_acceleration_structure_serialized_address_valid(list, src) ||
+            !dst || (dst & (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT - 1)) || dst == src)
+    {
+        ERR("Invalid serialized AS source/destination or missing deserialize command.\n");
+        return false;
+    }
+
+    /* The type is inside GPU memory. Invalidate any previously recorded type:
+     * the same address can now contain the other kind. MUTATED also prevents
+     * a later recording from turning an earlier GPU-only type into a guess. */
+    dst_as = vkd3d_va_map_place_acceleration_structure(&list->device->memory_allocator.va_map,
+            list->device, dst, VKD3D_RTAS_KIND_MUTATED);
+    if (!dst_as)
+    {
+        ERR("Could not place deserialized AS at %#"PRIx64".\n", dst);
+        return false;
+    }
+
+    if (FAILED(hr = d3d12_command_list_prepare_rtas_metadata(list, dst, src, VKD3D_RTAS_METADATA_DESERIALIZE)))
+    {
+        vkd3d_acceleration_structure_recording_error(list, hr, "deserialization continuation allocation failed");
+        return false;
+    }
+
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_ACCELERATION_STRUCTURE_INFO_KHR;
+    info.src.deviceAddress = src;
+    info.dst = dst_as;
+    info.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR;
+    VK_CALL(vkCmdCopyMemoryToAccelerationStructureKHR(list->cmd.vk_command_buffer, &info));
+    return true;
+}
+
+bool vkd3d_acceleration_structure_copy(
         struct d3d12_command_list *list,
         D3D12_GPU_VIRTUAL_ADDRESS dst, VkAccelerationStructureKHR src_as,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode,
         enum vkd3d_rtas_kind rtas_kind)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+    VkCopyAccelerationStructureToMemoryInfoKHR serialize_info;
     VkCopyAccelerationStructureInfoKHR info;
     VkAccelerationStructureKHR dst_as;
+
+    if (mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE)
+    {
+        if (!vk_procs->vkCmdCopyAccelerationStructureToMemoryKHR ||
+                !vkd3d_acceleration_structure_serialized_address_valid(list, dst))
+        {
+            ERR("Invalid serialized AS destination or missing serialize command.\n");
+            return false;
+        }
+
+        memset(&serialize_info, 0, sizeof(serialize_info));
+        serialize_info.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_TO_MEMORY_INFO_KHR;
+        serialize_info.src = src_as;
+        serialize_info.dst.deviceAddress = dst;
+        serialize_info.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR;
+        VK_CALL(vkCmdCopyAccelerationStructureToMemoryKHR(list->cmd.vk_command_buffer, &serialize_info));
+        return true;
+    }
+
+    if (!dst || (dst & (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT - 1)))
+        return false;
+
+    memset(&info, 0, sizeof(info));
+    if (!convert_copy_mode(mode, &info.mode))
+        return false;
 
     dst_as = vkd3d_va_map_place_acceleration_structure(&list->device->memory_allocator.va_map, list->device, dst, rtas_kind);
 
     if (dst_as == VK_NULL_HANDLE)
     {
         ERR("Invalid dst address #%"PRIx64" for %s copy.\n", dst, vkd3d_get_rtas_kind_string(rtas_kind));
-        return;
+        return false;
     }
-
-    memset(&info, 0, sizeof(info));
-
-    if (!convert_copy_mode(mode, &info.mode))
-        return;
 
     info.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
     info.dst = dst_as;
     info.src = src_as;
 
     VK_CALL(vkCmdCopyAccelerationStructureKHR(list->cmd.vk_command_buffer, &info));
+    return true;
 }
 
 struct vkd3d_empty_rtas_build_info
@@ -720,4 +783,3 @@ end_unlock:
 end:
     return va;
 }
-

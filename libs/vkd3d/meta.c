@@ -235,7 +235,7 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
         VkPipelineLayout layout, VkFormat color_format, VkFormat ds_format, VkImageAspectFlags vk_aspect_mask,
         VkShaderModule vs_module, VkShaderModule fs_module, VkSampleCountFlagBits samples,
         const VkPipelineDepthStencilStateCreateInfo *ds_state, uint32_t dynamic_state_count, const VkDynamicState *dynamic_states,
-        const VkSpecializationInfo *spec_info, bool descriptor_buffer_compatible, VkPipeline *vk_pipeline)
+        const VkSpecializationInfo *spec_info, bool descriptor_buffer_compatible, bool depth_clamp, VkPipeline *vk_pipeline)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &meta_ops->device->vk_procs;
     VkPipelineColorBlendAttachmentState blend_attachment;
@@ -295,7 +295,7 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
     rs_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs_state.pNext = NULL;
     rs_state.flags = 0;
-    rs_state.depthClampEnable = VK_TRUE;
+    rs_state.depthClampEnable = depth_clamp;
     rs_state.rasterizerDiscardEnable = VK_FALSE;
     rs_state.polygonMode = VK_POLYGON_MODE_FILL;
     rs_state.cullMode = VK_CULL_MODE_NONE;
@@ -759,7 +759,7 @@ static HRESULT vkd3d_meta_create_swapchain_pipeline(struct vkd3d_meta_ops *meta_
     if ((vr = vkd3d_meta_create_graphics_pipeline(meta_ops,
             meta_swapchain_ops->vk_pipeline_layouts[key->filter], key->format, VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT,
             meta_swapchain_ops->vk_vs_module, meta_swapchain_ops->vk_fs_module, 1,
-            NULL, 0, NULL, NULL, false, &pipeline->vk_pipeline)) < 0)
+            NULL, 0, NULL, NULL, false, true, &pipeline->vk_pipeline)) < 0)
         return hresult_from_vk_result(vr);
 
     pipeline->key = *key;
@@ -877,7 +877,7 @@ static HRESULT vkd3d_meta_create_copy_image_pipeline(struct vkd3d_meta_ops *meta
             VK_NULL_HANDLE, vk_module, key->sample_count,
             has_depth_target ? &ds_state : NULL,
             dynamic_state_count, dynamic_states,
-            &spec_info, true, &pipeline->vk_pipeline)) < 0)
+            &spec_info, true, true, &pipeline->vk_pipeline)) < 0)
         return hresult_from_vk_result(vr);
 
     pipeline->key = *key;
@@ -1234,7 +1234,7 @@ static HRESULT vkd3d_meta_create_resolve_image_graphics_pipeline(struct vkd3d_me
             VK_NULL_HANDLE, vk_module, VK_SAMPLE_COUNT_1_BIT,
             has_depth_target ? &ds_state : NULL,
             dynamic_state_count, dynamic_states,
-            &spec_info, true, &pipeline->vk_pipeline)) < 0)
+            &spec_info, true, true, &pipeline->vk_pipeline)) < 0)
         return hresult_from_vk_result(vr);
 
     memset(&pipeline->key, 0, sizeof(pipeline->key));
@@ -1557,10 +1557,13 @@ static void vkd3d_query_ops_cleanup(struct vkd3d_query_ops *meta_query_ops,
 
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_gather_occlusion_pipeline, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_gather_so_statistics_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_gather_pipeline_statistics_pipeline, NULL));
 
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_query_ops->vk_gather_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_query_ops->vk_resolve_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_resolve_binary_pipeline, NULL));
+    VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_dgc_pipeline, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_query_ops->vk_dgc_pipeline_layout, NULL));
 }
 
 static HRESULT vkd3d_query_ops_init(struct vkd3d_query_ops *meta_query_ops,
@@ -1598,6 +1601,24 @@ static HRESULT vkd3d_query_ops_init(struct vkd3d_query_ops *meta_query_ops,
             &meta_query_ops->vk_gather_so_statistics_pipeline)) < 0)
         goto fail;
 
+    if (device->device_info.device_generated_commands_features.deviceGeneratedCommands)
+    {
+        field_count = sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS) / sizeof(uint64_t);
+        if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_resolve_query), cs_resolve_query,
+                meta_query_ops->vk_gather_pipeline_layout, &spec_info, true, NULL,
+                &meta_query_ops->vk_gather_pipeline_statistics_pipeline)) < 0)
+            goto fail;
+
+        push_constant_range.size = sizeof(struct vkd3d_dgc_query_args);
+        if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL,
+                &push_constant_range, &meta_query_ops->vk_dgc_pipeline_layout)) < 0)
+            goto fail;
+        if ((vr = vkd3d_meta_create_compute_pipeline(device, sizeof(cs_dgc_query), cs_dgc_query,
+                meta_query_ops->vk_dgc_pipeline_layout, NULL, true, NULL,
+                &meta_query_ops->vk_dgc_pipeline)) < 0)
+            goto fail;
+    }
+
     push_constant_range.size = sizeof(struct vkd3d_query_resolve_args);
 
     if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL,
@@ -1630,6 +1651,9 @@ bool vkd3d_meta_get_query_gather_pipeline(struct vkd3d_meta_ops *meta_ops,
         case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
             info->vk_pipeline = query_ops->vk_gather_so_statistics_pipeline;
             return true;
+        case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+            info->vk_pipeline = query_ops->vk_gather_pipeline_statistics_pipeline;
+            return info->vk_pipeline != VK_NULL_HANDLE;
         default:
             ERR("No pipeline for query heap type %u.\n", heap_type);
             return false;
@@ -2149,7 +2173,7 @@ static HRESULT vkd3d_sampler_feedback_ops_init(struct vkd3d_sampler_feedback_res
             if ((vr = vkd3d_meta_create_graphics_pipeline(&device->meta_ops,
                     sampler_feedback_ops->vk_graphics_decode_layout,
                     VK_FORMAT_R8_UINT, VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE, vk_module,
-                    VK_SAMPLE_COUNT_1_BIT, NULL, 0, NULL, NULL, true,
+                    VK_SAMPLE_COUNT_1_BIT, NULL, 0, NULL, NULL, true, true,
                     &sampler_feedback_ops->vk_pipelines[pipelines[i].type])))
             {
                 VK_CALL(vkDestroyShaderModule(device->vk_device, vk_module, NULL));
@@ -2344,6 +2368,8 @@ void vkd3d_meta_get_workgraph_complete_compaction_pipeline(struct vkd3d_meta_ops
     info->vk_pipeline = meta_ops->workgraph.vk_complete_compaction_pipeline;
 }
 
+#include "tiled_copy_meta.h"
+
 HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device)
 {
     HRESULT hr;
@@ -2403,6 +2429,7 @@ HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device
     if (FAILED(hr = vkd3d_workgraph_ops_init(&meta_ops->workgraph, device)))
         goto fail_workgraphs;
 
+
     return S_OK;
 
 fail_workgraphs:
@@ -2441,6 +2468,7 @@ fail_common:
 
 HRESULT vkd3d_meta_ops_cleanup(struct vkd3d_meta_ops *meta_ops, struct d3d12_device *device)
 {
+    vkd3d_tiled_copy_cleanup(device);
     vkd3d_workgraph_ops_cleanup(&meta_ops->workgraph, device);
     vkd3d_sampler_feedback_ops_cleanup(&meta_ops->sampler_feedback_heap, device);
     vkd3d_sampler_feedback_ops_cleanup(&meta_ops->sampler_feedback_legacy, device);
