@@ -11486,10 +11486,16 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
     }
     device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
     caps = &device->d3d12_caps;
-    if (!d3d12_device_supports_feature_level(device, minimum_feature_level) || caps->max_shader_model < D3D_SHADER_MODEL_6_0)
+    /* caps12.rs reports SM6.3 and RT1.0 independently of the requested FL.
+     * These are engine-derived requirements, not feature-level overrides.
+     * Check them for every device so an FL11_0 request cannot bypass DXR
+     * backing while the native runtime exposes the same optional tier. */
+    if (!d3d12_device_supports_feature_level(device, minimum_feature_level) ||
+            caps->max_shader_model < D3D_SHADER_MODEL_6_3 ||
+            caps->options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
     {
-        ERR("Native feature admission failed: engine FL %#x SM %#x, required FL %#x SM 6.0.\n",
-                caps->max_feature_level, caps->max_shader_model, minimum_feature_level);
+        ERR("Native feature admission failed: engine FL %#x SM %#x RT %u, required FL %#x SM 6.3 RT 1.0.\n",
+                caps->max_feature_level, caps->max_shader_model, caps->options5.RaytracingTier, minimum_feature_level);
         return DXGI_ERROR_UNSUPPORTED;
     }
     if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
@@ -11517,7 +11523,7 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
                 device->device_info.features2.features.shaderStorageImageWriteWithoutFormat);
         return DXGI_ERROR_UNSUPPORTED;
     }
-    INFO("Native feature admission: FL %#x with implemented tiled copy and compatibility backing.\n", minimum_feature_level);
+    INFO("Native feature admission: FL %#x SM 6.3 RT 1.0 with implemented tiled copy and compatibility backing.\n", minimum_feature_level);
     return S_OK;
 }
 
