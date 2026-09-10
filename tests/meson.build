@@ -93,3 +93,9 @@ executable('pso-library-bloat', 'pso_library_bloat.c',
   install             : false,
   c_args              : vkd3d_test_flags,
   link_with           : [ d3d12_test_utils_lib ])
+
+if host_machine.system() == 'linux' and vkd3d_compiler.has_function('__libc_calloc',
+    prefix: '#include <stddef.h>\nextern void *__libc_calloc(size_t, size_t);')
+  shared_library('rtas-prebuild-alloc-fault', 'rtas_prebuild_alloc_fault.c',
+    install: false)
+endif

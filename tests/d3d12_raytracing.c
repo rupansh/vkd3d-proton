@@ -665,7 +665,7 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
         struct test_geometry *geom,
         unsigned int num_geom_desc, float geom_offset_x,
         unsigned int num_unmasked_instances_y, float instance_geom_scale, float instance_offset_y,
-        D3D12_GPU_VIRTUAL_ADDRESS postbuild_va)
+        D3D12_GPU_VIRTUAL_ADDRESS postbuild_va, bool high_stride)
 {
 #define NUM_GEOM_TEMPLATES 6
 #define NUM_AABB_PER_GEOM 2
@@ -745,6 +745,10 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION |
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
 
+    if (high_stride)
+        for (i = 0; i < ARRAY_SIZE(geom_desc_template); ++i)
+            geom_desc_template[i].Triangles.VertexBuffer.StrideInBytes |= (UINT64)0xfedcba98 << 32;
+
     geom_desc = malloc(sizeof(*geom_desc) * num_geom_desc);
     for (i = 0; i < num_geom_desc; i++)
         geom_desc[i] = geom_desc_template[i % ARRAY_SIZE(geom_desc_template)];
@@ -772,7 +776,8 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
         geom_desc[i].AABBs.AABBCount = NUM_AABB_PER_GEOM;
         geom_desc[i].AABBs.AABBs.StartAddress = ID3D12Resource_GetGPUVirtualAddress(rt_geom->aabb_buffer) +
                 i * geom_desc[i].AABBs.AABBCount * sizeof(D3D12_RAYTRACING_AABB);
-        geom_desc[i].AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB);
+        geom_desc[i].AABBs.AABBs.StrideInBytes = sizeof(D3D12_RAYTRACING_AABB) |
+                (high_stride ? (UINT64)0xabcdef01 << 32 : 0);
     }
 
     create_acceleration_structure(context, &inputs, &rt_geom->bottom_rtas_aabb, 0);
@@ -1238,7 +1243,7 @@ static uint32_t test_mode_to_trace_flags(enum rt_test_mode mode)
 #include "d3d12_rtas_serialization.h"
 #include "d3d12_rtas_recording.h"
 
-static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TIER minimum_tier)
+static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TIER minimum_tier, bool high_stride)
 {
 #define NUM_GEOM_DESC 6
 #define NUM_UNMASKED_INSTANCES 8
@@ -1305,7 +1310,7 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
     init_rt_geometry(&context, &test_rtases, &test_geom,
             NUM_GEOM_DESC, GEOM_OFFSET_X,
             serialized_instance_count, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y,
-            ID3D12Resource_GetGPUVirtualAddress(postbuild_buffer));
+            ID3D12Resource_GetGPUVirtualAddress(postbuild_buffer), high_stride);
 
     /* Create global root signature. All RT shaders can access these parameters. */
     {
@@ -2102,12 +2107,12 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
 
 void test_raytracing_serialization(void)
 {
-    test_raytracing_pipeline(TEST_MODE_SERIALIZE, D3D12_RAYTRACING_TIER_1_0);
+    test_raytracing_pipeline(TEST_MODE_SERIALIZE, D3D12_RAYTRACING_TIER_1_0, false);
 }
 
 void test_raytracing_serialization_large(void)
 {
-    test_raytracing_pipeline(TEST_MODE_SERIALIZE_LARGE, D3D12_RAYTRACING_TIER_1_0);
+    test_raytracing_pipeline(TEST_MODE_SERIALIZE_LARGE, D3D12_RAYTRACING_TIER_1_0, false);
 }
 
 void test_raytracing(void)
@@ -2136,7 +2141,7 @@ void test_raytracing(void)
     for (i = 0; i < ARRAY_SIZE(tests); i++)
     {
         vkd3d_test_set_context("Test: %s", tests[i].desc);
-        test_raytracing_pipeline(tests[i].mode, tests[i].minimum_tier);
+        test_raytracing_pipeline(tests[i].mode, tests[i].minimum_tier, false);
     }
     vkd3d_test_set_context(NULL);
 }
@@ -2218,7 +2223,7 @@ static void test_rayquery_pipeline(enum rt_test_mode mode, bool root_table)
     init_test_geometry(device, &test_geom);
     init_rt_geometry(&context, &test_rtases, &test_geom,
             NUM_GEOM_DESC, GEOM_OFFSET_X,
-            NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0);
+            NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0, false);
 
     {
         /* For test, we want to hit miss shader, then hit group indices in order. */
@@ -2432,7 +2437,7 @@ static void test_raytracing_local_rs_static_sampler_inner(bool use_libraries)
 
     init_test_geometry(device, &test_geom);
     init_rt_geometry(&context, &test_rtases, &test_geom,
-            2, 10.0f, 2, 1.0f, 10.0f, 0);
+            2, 10.0f, 2, 1.0f, 10.0f, 0, false);
 
     /* Global root signature */
     {
@@ -4137,7 +4142,7 @@ void test_raytracing_mismatch_global_rs_link(void)
     init_test_geometry(device, &test_geom);
     init_rt_geometry(&context, &test_rtases, &test_geom,
         NUM_GEOM_DESC, GEOM_OFFSET_X,
-        NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0);
+        NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0, false);
 
     memset(&rs_desc, 0, sizeof(rs_desc));
     memset(rs_params, 0, sizeof(rs_params));
@@ -5588,4 +5593,12 @@ void test_raytracing_serialization_rejection(void)
         ID3D12Resource_Release(destination);
         destroy_raytracing_test_context(&context);
     }
+}
+
+#include "d3d12_rtas_inputs.h"
+
+void test_raytracing_high_stride(void)
+{
+    trace("RTAS_HIGH_STRIDE,triangle_and_AABB_build_update_copy_serialize_ray_readback\n");
+    test_raytracing_pipeline(TEST_MODE_SERIALIZE, D3D12_RAYTRACING_TIER_1_0, true);
 }

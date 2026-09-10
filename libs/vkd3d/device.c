@@ -8915,6 +8915,20 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
 
     TRACE("iface %p, desc %p, info %p!\n", iface, desc, info);
 
+    if (!info)
+    {
+        ERR("Null acceleration-structure prebuild output.\n");
+        return;
+    }
+    /* No successful Vulkan query means no usable storage requirement. Never
+     * leave a previous caller result behind on conversion/allocation failure. */
+    memset(info, 0, sizeof(*info));
+    if (!desc)
+    {
+        ERR("Null acceleration-structure prebuild input.\n");
+        return;
+    }
+
     if (!d3d12_device_supports_ray_tracing_tier_1_0(device))
     {
         ERR("Acceleration structure is not supported. Calling this is invalid.\n");
@@ -8928,6 +8942,9 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
         return;
     }
 
+    if (!vkd3d_acceleration_structure_validate_input_header(desc))
+        return;
+
     geometry_count = vkd3d_acceleration_structure_get_geometry_count(desc);
     primitive_counts = primitive_counts_stack;
     geometries = geometries_stack;
@@ -8935,9 +8952,14 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
 
     if (geometry_count > VKD3D_BUILD_INFO_STACK_COUNT)
     {
-        primitive_counts = vkd3d_malloc(geometry_count * sizeof(*primitive_counts));
-        geometries = vkd3d_malloc(geometry_count * sizeof(*geometries));
-        omm_triangles_infos = vkd3d_malloc(geometry_count * sizeof(*omm_triangles_infos));
+        primitive_counts = vkd3d_calloc(geometry_count, sizeof(*primitive_counts));
+        geometries = vkd3d_calloc(geometry_count, sizeof(*geometries));
+        omm_triangles_infos = vkd3d_calloc(geometry_count, sizeof(*omm_triangles_infos));
+        if (!primitive_counts || !geometries || !omm_triangles_infos)
+        {
+            ERR("Failed to allocate acceleration-structure prebuild geometry arrays.\n");
+            goto cleanup;
+        }
     }
 
     if (!vkd3d_acceleration_structure_convert_inputs(device,
@@ -8979,6 +9001,9 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
         /* Default API path. */
         info->UpdateScratchDataSizeInBytes = size_info.updateScratchSize;
     }
+
+    if (!(desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE))
+        info->UpdateScratchDataSizeInBytes = 0;
 
     TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", info->ResultDataMaxSizeInBytes);
     TRACE("ScratchDatSizeInBytes: %"PRIu64".\n", info->ScratchDataSizeInBytes);

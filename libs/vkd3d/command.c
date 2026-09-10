@@ -21578,6 +21578,9 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     size_t old_build_count = list->rtas_batch.build_info_count;
     size_t old_geometry_count = list->rtas_batch.geometry_info_count;
 
+    if (!vkd3d_acceleration_structure_validate_input_header(&desc->Inputs))
+        goto fail;
+
     /* Both AS addresses are CPU-visible even when their contents are produced
      * later on the GPU. A zero destination used to bypass placement and leave
      * a null handle in the batch, which Close could otherwise flush as success.
@@ -21770,6 +21773,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_BuildRaytracingAccelerationStru
 
     TRACE("iface %p, desc %p, num_postbuild_info_descs %u, postbuild_info_descs %p\n",
             iface, desc, num_postbuild_info_descs, postbuild_info_descs);
+
+    if (!desc || (num_postbuild_info_descs && !postbuild_info_descs))
+    {
+        d3d12_command_list_mark_as_invalid(list, "Null AS build description or postbuild array.\n");
+        return;
+    }
 
     d3d12_command_list_check_render_pass_validation(list, "BuildRaytracingAccelerationStructure called within a render pass.\n", true);
     d3d12_command_list_flush_dgc_batch(list);

@@ -68,6 +68,50 @@ uint32_t vkd3d_acceleration_structure_get_geometry_count(
         return desc->NumDescs;
 }
 
+bool vkd3d_acceleration_structure_validate_input_header(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc)
+{
+    const unsigned int known_flags =
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE |
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_DISABLE_OMMS;
+
+    /* Validate the CPU envelope before sizing arrays or choosing a union arm.
+     * GPU addresses are deliberately not inspected here: prebuild queries may
+     * use dummy nonzero addresses, and never read GPU geometry or instances. */
+    if (!desc || (desc->Flags & ~known_flags) ||
+            ((desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE) &&
+            (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)) ||
+            (desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS))
+        goto invalid;
+
+    if (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
+    {
+        if (desc->NumDescs > D3D12_RAYTRACING_MAX_INSTANCES_PER_TOP_LEVEL_ACCELERATION_STRUCTURE)
+            goto invalid;
+    }
+    else if (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+    {
+        if (desc->NumDescs > D3D12_RAYTRACING_MAX_GEOMETRIES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE ||
+                (desc->NumDescs && (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY ?
+                !desc->pGeometryDescs : !desc->ppGeometryDescs)))
+            goto invalid;
+    }
+    else
+        goto invalid;
+    return true;
+
+invalid:
+    ERR("Invalid acceleration-structure input type, layout, flags, count or CPU array.\n");
+    return false;
+}
+
 static void vkd3d_acceleration_structure_convert_triangles(const struct d3d12_device *device,
         const D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC *desc,
         VkAccelerationStructureGeometryKHR *geometry_info,
@@ -102,7 +146,9 @@ static void vkd3d_acceleration_structure_convert_triangles(const struct d3d12_de
     }
 
     triangles->maxVertex = max(1, desc->VertexCount) - 1;
-    triangles->vertexStride = desc->VertexBuffer.StrideInBytes;
+    /* DXR defines only the low 32 bits, including for the public COM API.
+     * The UINT64 field supplies ABI alignment; its high word is ignored. */
+    triangles->vertexStride = (uint32_t)desc->VertexBuffer.StrideInBytes;
     triangles->vertexFormat = vkd3d_internal_get_vk_format(device, desc->VertexFormat);
     triangles->vertexData.deviceAddress = desc->VertexBuffer.StartAddress;
     triangles->transformData.deviceAddress = desc->Transform3x4;
@@ -124,11 +170,15 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
     VkAccelerationStructureGeometryAabbsDataKHR *aabbs;
     const D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc;
     bool have_triangles, have_aabbs;
+    uint64_t total_primitives = 0;
     uint32_t primitive_count;
     unsigned int i;
 
     RT_TRACE("Converting inputs.\n");
     RT_TRACE("=====================\n");
+
+    if (!vkd3d_acceleration_structure_validate_input_header(desc))
+        return false;
 
     memset(build_info, 0, sizeof(*build_info));
     build_info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
@@ -216,6 +266,13 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
                 RT_TRACE("  PointerToArray\n");
             }
 
+            if (!geom_desc || (geom_desc->Flags & ~(D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE |
+                    D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION)))
+            {
+                ERR("Invalid geometry descriptor or flags at index %u.\n", i);
+                return false;
+            }
+
             geometry_infos[i].flags = d3d12_geometry_flags_to_vk(geom_desc->Flags);
             RT_TRACE("  Flags = #%x\n", geom_desc->Flags);
 
@@ -246,8 +303,16 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
                     geometry_infos[i].geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
                     aabbs = &geometry_infos[i].geometry.aabbs;
                     aabbs->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
-                    aabbs->stride = geom_desc->AABBs.AABBs.StrideInBytes;
+                    aabbs->stride = (uint32_t)geom_desc->AABBs.AABBs.StrideInBytes;
                     aabbs->data.deviceAddress = geom_desc->AABBs.AABBs.StartAddress;
+                    /* AABBCount is UINT64; reject before narrowing to Vulkan's
+                     * UINT32 primitiveCount, including exact 2^32 wraparound. */
+                    if (geom_desc->AABBs.AABBCount >
+                            D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE)
+                    {
+                        ERR("AABB primitive count exceeds the DXR limit.\n");
+                        return false;
+                    }
                     primitive_count = geom_desc->AABBs.AABBCount;
                     RT_TRACE("  AABB stride: %"PRIu64" bytes\n", geom_desc->AABBs.AABBs.StrideInBytes);
                     break;
@@ -281,6 +346,13 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
                 default:
                     FIXME("Unsupported geometry type %u.\n", geom_desc->Type);
                     return false;
+            }
+
+            total_primitives += primitive_count;
+            if (total_primitives > D3D12_RAYTRACING_MAX_PRIMITIVES_PER_BOTTOM_LEVEL_ACCELERATION_STRUCTURE)
+            {
+                ERR("BLAS primitive count exceeds the DXR limit.\n");
+                return false;
             }
 
             if (primitive_counts)
