@@ -11468,13 +11468,15 @@ static bool d3d12_device_supports_feature_level(struct d3d12_device *device, D3D
 
 /* Static native UMD admission, separate from the ordinary engine entry point.
  * The caller holds the returned device until this check succeeds or fails. */
-HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t minimum_feature_level)
+HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t minimum_feature_level,
+        uint32_t *shader_model, uint32_t *raytracing_tier, uint8_t *device_uuid)
 {
     struct d3d12_device *device;
     const struct d3d12_caps *caps;
     char override[VKD3D_PATH_MAX];
 
-    if (!iface || (minimum_feature_level != D3D_FEATURE_LEVEL_11_0 && minimum_feature_level != D3D_FEATURE_LEVEL_12_1))
+    if (!iface || !shader_model || !raytracing_tier || !device_uuid ||
+            (minimum_feature_level != D3D_FEATURE_LEVEL_11_0 && minimum_feature_level != D3D_FEATURE_LEVEL_12_1))
         return E_INVALIDARG;
     /* The engine's developer overrides modify the derived caps. They cannot
      * supply evidence for a native driver contract, even when set lower. */
@@ -11486,16 +11488,14 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
     }
     device = impl_from_ID3D12Device((d3d12_device_iface *)iface);
     caps = &device->d3d12_caps;
-    /* caps12.rs reports SM6.3 and RT1.0 independently of the requested FL.
-     * These are engine-derived requirements, not feature-level overrides.
-     * Check them for every device so an FL11_0 request cannot bypass DXR
-     * backing while the native runtime exposes the same optional tier. */
+    /* Wave operations are part of the native baseline. DXR is optional and
+     * must not prevent non-RT hardware from using that baseline. Return the
+     * actual optional caps below for adapter reporting and device revalidation. */
     if (!d3d12_device_supports_feature_level(device, minimum_feature_level) ||
-            caps->max_shader_model < D3D_SHADER_MODEL_6_3 ||
-            caps->options5.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
+            caps->max_shader_model < D3D_SHADER_MODEL_6_0)
     {
-        ERR("Native feature admission failed: engine FL %#x SM %#x RT %u, required FL %#x SM 6.3 RT 1.0.\n",
-                caps->max_feature_level, caps->max_shader_model, caps->options5.RaytracingTier, minimum_feature_level);
+        ERR("Native feature admission failed: engine FL %#x SM %#x, required FL %#x SM 6.0.\n",
+                caps->max_feature_level, caps->max_shader_model, minimum_feature_level);
         return DXGI_ERROR_UNSUPPORTED;
     }
     if (minimum_feature_level >= D3D_FEATURE_LEVEL_12_0 &&
@@ -11523,7 +11523,11 @@ HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t
                 device->device_info.features2.features.shaderStorageImageWriteWithoutFormat);
         return DXGI_ERROR_UNSUPPORTED;
     }
-    INFO("Native feature admission: FL %#x SM 6.3 RT 1.0 with implemented tiled copy and compatibility backing.\n", minimum_feature_level);
+    *shader_model = caps->max_shader_model;
+    *raytracing_tier = caps->options5.RaytracingTier;
+    memcpy(device_uuid, device->device_info.vulkan_1_1_properties.deviceUUID, VK_UUID_SIZE);
+    INFO("Native feature admission: FL %#x engine SM %#x RT %u with implemented tiled copy and compatibility backing.\n",
+            minimum_feature_level, *shader_model, *raytracing_tier);
     return S_OK;
 }
 

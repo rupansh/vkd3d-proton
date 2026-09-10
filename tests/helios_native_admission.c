@@ -12,6 +12,8 @@ int main(int argc, char **argv)
     LUID luid = {0};
     HRESULT hr, expected;
     unsigned int failures = 0;
+    uint32_t shader_model = 0, raytracing_tier = 0;
+    uint8_t device_uuid[VK_UUID_SIZE] = {0};
 
     if (argc != 2 || (strcmp(argv[1], "supported") && strcmp(argv[1], "unsupported")))
         return 2;
@@ -21,14 +23,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "Engine creation failed: %#x.\n", (unsigned int)hr);
         return 1;
     }
-    hr = helios_vkd3d_validate_native_feature_level(device, D3D_FEATURE_LEVEL_12_1);
+    hr = helios_vkd3d_validate_native_feature_level(device, D3D_FEATURE_LEVEL_12_1, &shader_model, &raytracing_tier, device_uuid);
     if (hr != expected)
     {
         fprintf(stderr, "Admission %#x, expected %#x.\n", (unsigned int)hr, (unsigned int)expected);
         failures++;
     }
-    failures += helios_vkd3d_validate_native_feature_level(NULL, D3D_FEATURE_LEVEL_12_1) != E_INVALIDARG;
-    failures += helios_vkd3d_validate_native_feature_level(device, D3D_FEATURE_LEVEL_12_2) != E_INVALIDARG;
+    failures += helios_vkd3d_validate_native_feature_level(NULL, D3D_FEATURE_LEVEL_12_1, &shader_model, &raytracing_tier, device_uuid) != E_INVALIDARG;
+    failures += helios_vkd3d_validate_native_feature_level(device, D3D_FEATURE_LEVEL_12_2, &shader_model, &raytracing_tier, device_uuid) != E_INVALIDARG;
+    printf("CAPS,SM,%#x,RT,%u\n", shader_model, raytracing_tier);
     /* Releasing a refused engine must be safe without a native device owner. */
     ID3D12Device_Release(device);
     printf("%s: native backing admission %s; 3 checks, %u failures.\n",
