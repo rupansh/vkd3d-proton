@@ -21,7 +21,13 @@
 #include "vkd3d_string.h"
 #include "vkd3d_descriptor_debug.h"
 
-#define RT_TRACE TRACE
+/* RTPSO construction diagnostics must also work in the native release UMD.
+ * General API TRACE is compiled out there. Keep this limited to the existing
+ * opt-in VKD3D_DEBUG=trace level; ordinary dispatch does not use RT_TRACE. */
+#define RT_TRACE(...) do { \
+    if (vkd3d_dbg_get_level(VKD3D_DBG_CHANNEL_API) == VKD3D_DBG_LEVEL_TRACE) \
+        INFO(__VA_ARGS__); \
+} while (0)
 
 static inline struct d3d12_rt_state_object *impl_from_ID3D12StateObjectProperties(d3d12_state_object_properties_iface *iface)
 {
