@@ -2819,20 +2819,23 @@ static HRESULT d3d12_command_allocator_allocate_init_post_indirect_command_buffe
 static void d3d12_command_allocator_free_vk_command_buffer(
         struct d3d12_command_allocator *allocator,
         struct d3d12_command_allocator_command_pool *pool,
-        VkCommandBuffer vk_command_buffer)
+        VkCommandBuffer vk_command_buffer, struct d3d12_command_list *list)
 {
-    struct d3d12_device *device = allocator->device;
-    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-
     if (!vk_command_buffer)
         return;
 
-    if (!vkd3d_array_reserve((void **)&pool->pending.command_buffers, &pool->pending.command_buffers_size,
+    if (pool->pending.command_buffer_count == SIZE_MAX ||
+            !vkd3d_array_reserve((void **)&pool->pending.command_buffers, &pool->pending.command_buffers_size,
             pool->pending.command_buffer_count + 1, sizeof(*pool->pending.command_buffers)))
     {
-        WARN("Failed to add command buffer.\n");
-        VK_CALL(vkFreeCommandBuffers(device->vk_device, pool->vk_command_pool,
-                1, &vk_command_buffer));
+        /* Close still owns a recorded handle that could be submitted later.
+         * Keep it owned by the Vulkan pool and fail Close, rather than free
+         * the buffer and leave the list pointing at released command storage.
+         * Release of a recording list needs no HRESULT, but still retains the
+         * untracked handle until allocator destruction. */
+        d3d12_command_list_mark_as_invalid(list,
+                "Failed to retain command buffer recycling metadata; pool retains storage.\n");
+        list->recording_error = E_OUTOFMEMORY;
     }
     else
         pool->pending.command_buffers[pool->pending.command_buffer_count++] = vk_command_buffer;
@@ -2850,9 +2853,11 @@ static HRESULT d3d12_command_allocator_reset_command_pool(
         return S_OK;
 
     /* Just keep reusing the command buffers without allocate/free pairs. */
-    vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
+    if (pool->pending.command_buffer_count > SIZE_MAX - pool->recycled.command_buffer_count ||
+            !vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
             pool->recycled.command_buffer_count + pool->pending.command_buffer_count,
-            sizeof(*pool->recycled.command_buffers));
+            sizeof(*pool->recycled.command_buffers)))
+        return E_OUTOFMEMORY;
 
     memcpy(pool->recycled.command_buffers + pool->recycled.command_buffer_count,
             pool->pending.command_buffers,
@@ -2891,26 +2896,26 @@ static void d3d12_command_allocator_free_command_buffer(struct d3d12_command_all
 
     d3d12_command_allocator_free_vk_command_buffer(allocator,
             &allocator->primary_pool,
-            list->cmd.suspend_resume.suspend.vk_fixup_cmd_buffer);
+            list->cmd.suspend_resume.suspend.vk_fixup_cmd_buffer, list);
     d3d12_command_allocator_free_vk_command_buffer(allocator,
             &allocator->primary_pool,
-            list->cmd.suspend_resume.resume.vk_fixup_cmd_buffer);
+            list->cmd.suspend_resume.resume.vk_fixup_cmd_buffer, list);
     d3d12_command_allocator_free_vk_command_buffer(allocator,
             &allocator->primary_pool,
-            list->cmd.vk_query_reset_commands);
+            list->cmd.vk_query_reset_commands, list);
     d3d12_command_allocator_free_vk_command_buffer(allocator,
             &allocator->primary_pool,
-            list->cmd.vk_cleanup_commands);
+            list->cmd.vk_cleanup_commands, list);
 
     for (i = 0; i < list->cmd.iteration_count; i++)
     {
         d3d12_command_allocator_free_vk_command_buffer(allocator,
                 d3d12_command_allocator_sequence_pool(allocator, list->cmd.iterations[i].fallback),
-                list->cmd.iterations[i].vk_command_buffer);
+                list->cmd.iterations[i].vk_command_buffer, list);
 
         d3d12_command_allocator_free_vk_command_buffer(allocator,
                 &allocator->primary_pool,
-                list->cmd.iterations[i].vk_post_indirect_barrier_commands);
+                list->cmd.iterations[i].vk_post_indirect_barrier_commands, list);
     }
 }
 
@@ -3348,6 +3353,30 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
     allocator->query_pool_count = 0;
     memset(&allocator->active_query_pools, 0, sizeof(allocator->active_query_pools));
     return S_OK;
+}
+
+/* Native WDDM completion can become visible before the independent fence
+ * worker releases this allocator. S_FALSE means storage is still owned by an
+ * execution: the frontend must retain it and select another generation. This
+ * is not GPU completion and never permits resetting the pending pools.
+ * The caller owns a public reference and externally serializes allocator use. */
+HRESULT helios_vkd3d_try_reset_command_allocator(ID3D12CommandAllocator *iface)
+{
+    struct d3d12_command_allocator *allocator;
+
+    if (!iface)
+        return E_INVALIDARG;
+    /* Bundle allocators store CPU commands, with a different object layout.
+     * ExecuteBundle consumes them during recording, so their ordinary Reset
+     * already owns the complete lifetime contract. Never cast them below. */
+    if (iface->lpVtbl->Reset != d3d12_command_allocator_Reset)
+        return ID3D12CommandAllocator_Reset(iface);
+    allocator = impl_from_ID3D12CommandAllocator(iface);
+    if (allocator->current_command_list && allocator->current_command_list->is_recording)
+        return E_FAIL;
+    if (vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire) > 1)
+        return S_FALSE;
+    return d3d12_command_allocator_Reset(iface);
 }
 
 static CONST_VTBL struct ID3D12CommandAllocatorVtbl d3d12_command_allocator_vtbl =

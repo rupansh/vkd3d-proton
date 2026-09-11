@@ -1264,6 +1264,7 @@ void vkd3d_reserved_compat_init(struct d3d12_device *device);
 VkSampleCountFlags vkd3d_reserved_compat_sample_counts(const struct vkd3d_format *format);
 HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device *iface, uint32_t minimum_feature_level,
         uint32_t *shader_model, uint32_t *raytracing_tier, uint8_t *device_uuid);
+HRESULT helios_vkd3d_try_reset_command_allocator(ID3D12CommandAllocator *iface);
 void vkd3d_reserved_compat_note_mapping(struct d3d12_resource *resource, bool copy);
 
 static inline bool d3d12_resource_is_acceleration_structure(const struct d3d12_resource *resource)

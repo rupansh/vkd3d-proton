@@ -7,6 +7,11 @@ if vkd3d_platform != 'windows'
     link_with: [helios_d3d12_static_lib],
     include_directories: [vkd3d_private_includes, include_directories('../libs/vkd3d', '..')],
     install: false)
+  executable('helios-allocator-contract', 'helios_allocator_contract.c',
+    dependencies: [vkd3d_dep, lib_dl],
+    link_with: [helios_d3d12_static_lib],
+    include_directories: [vkd3d_private_includes, include_directories('../libs/vkd3d', '..')],
+    install: false)
   executable('helios-root-contract', 'helios_root_contract.c',
     dependencies: [vkd3d_dep, lib_dl],
     link_with: [helios_d3d12_static_lib],
